@@ -365,6 +365,9 @@ pub enum BlockAction {
     Opened,
     Relaunched,
     Running,
+    /// O bloco existe, mas sem programa nem shell: um `write` não chega a ninguém. O autor fecha o
+    /// bloco e o próximo `c` abre outro.
+    NoProgram,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -414,8 +417,8 @@ fn ensure_block(
             mux.write(session, &b.id, &format!("{line}\r"))?;
             Ok((b.id.clone(), BlockAction::Relaunched))
         }
-        // programa rodando, ou bloco sem foreground (um `write` ali não chega a nenhum programa)
-        Some((b, _)) => Ok((b.id.clone(), BlockAction::Running)),
+        Some((b, Some(_))) => Ok((b.id.clone(), BlockAction::Running)),
+        Some((b, None)) => Ok((b.id.clone(), BlockAction::NoProgram)),
     }
 }
 
@@ -467,7 +470,9 @@ pub fn combo(ctx: &Ctx, key: &PrKey) -> FocusResult<Combo> {
 
 /// `f`: entra na review pronta mais antiga. `Ok(None)` quando nenhuma está pronta.
 pub fn first_ready(ctx: &Ctx) -> FocusResult<Option<(PrKey, Entered)>> {
-    let state = State::read(&ctx.paths.state_file())?;
+    let mut state = State::read(&ctx.paths.state_file())?;
+    // worktree apagada desde o último sync: passa para a próxima pronta em vez de falhar nela
+    state.prs.retain(|_, r| r.path.exists());
     let Some(key) = pick_first_ready(&state) else {
         return Ok(None);
     };
@@ -1097,6 +1102,40 @@ mod tests {
         assert!(f.entry().is_some());
         f.save(Phase::Preparing);
         assert!(first_ready(&f.ctx()).unwrap().is_none());
+    }
+
+    #[test]
+    fn first_ready_skips_a_review_whose_worktree_vanished() {
+        let f = fx();
+        let mut s = State::read(&f.paths.state_file()).unwrap();
+        let mut gone = PrRecord::fixture("o/r", 3, "x", "s"); // epoch: o mais antigo
+        gone.path = f.wt.with_file_name("sumiu");
+        s.insert(gone);
+        let mut newer = s.get(&key()).unwrap().clone();
+        newer.first_seen_at = Utc::now();
+        s.insert(newer);
+        s.save(&f.paths.state_file()).unwrap();
+        assert_eq!(first_ready(&f.ctx()).unwrap().map(|(k, _)| k), Some(key()));
+    }
+
+    #[test]
+    fn combo_reports_a_block_left_without_a_program() {
+        let f = fx();
+        f.open_session();
+        combo(&f.ctx(), &key()).unwrap();
+        let id = f.entry().unwrap().session_id;
+        f.mux.sessions.borrow_mut().get_mut(&id).unwrap().blocks[1].process = None;
+        f.set_process("reviewr", program_at("reviewr", &f.wt));
+        let got = combo(&f.ctx(), &key()).unwrap();
+        assert_eq!(
+            (got.claude, got.reviewr),
+            (BlockAction::NoProgram, BlockAction::Running)
+        );
+        assert_eq!(
+            f.blocks()[1].written.len(),
+            1,
+            "não escreve num bloco sem programa"
+        );
     }
 
     #[test]

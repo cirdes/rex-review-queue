@@ -244,6 +244,7 @@ fn did(a: BlockAction) -> &'static str {
         BlockAction::Opened => "opened",
         BlockAction::Relaunched => "relaunched",
         BlockAction::Running => "already running",
+        BlockAction::NoProgram => "block has no program (close it and press c again)",
     }
 }
 
