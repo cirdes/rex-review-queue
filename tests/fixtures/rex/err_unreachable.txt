@@ -1,0 +1,2 @@
+Error: no Rex server is running at /tmp/rrq-nao-existe.sock, and autostart is disabled
+exit=4

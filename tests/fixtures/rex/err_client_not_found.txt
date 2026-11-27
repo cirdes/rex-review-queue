@@ -1,0 +1,2 @@
+Error: stream response "control-1" failed: client client:01a21d7d-0000-7000-8000-000000000000 not found (status=404 code=not_found)
+exit=3
