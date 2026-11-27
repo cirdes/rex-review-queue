@@ -357,14 +357,14 @@ mod tests {
 
     #[test]
     fn several_repos_show_repo_name_in_full() {
-        let c = ViewConfig { repos: vec!["linkanalabs/linkana".into(), "linkanalabs/vernissage".into()], ..cfg() };
+        let c = ViewConfig { repos: vec!["acme/loja".into(), "acme/api".into()], ..cfg() };
         let mut s = base_state();
-        s.insert(PrRecord::fixture("linkanalabs/linkana", 15672, "x", "s"));
-        s.insert(PrRecord::fixture("linkanalabs/vernissage", 312, "y", "s"));
+        s.insert(PrRecord::fixture("acme/loja", 15672, "x", "s"));
+        s.insert(PrRecord::fixture("acme/api", 312, "y", "s"));
         let view = View::build(Some(&s), &UiState::default(), &c, &UiFacts::default(), Utc::now());
         for w in [60u16, 110] {
             let out = screen(w, 24, &view, &UiState::default());
-            for needle in ["linkana#15672", "vernissage#312"] {
+            for needle in ["loja#15672", "api#312"] {
                 assert!(out.contains(needle), "{w} faltou {needle}:\n{out}");
             }
         }
