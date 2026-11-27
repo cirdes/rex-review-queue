@@ -84,7 +84,18 @@ pub fn load_for_panel(path: &Path) -> (Sessions, Option<String>) {
 
 /// Para o daemon: move o arquivo corrompido para `.corrupt-<ts>` e devolve o caminho novo.
 pub fn quarantine(path: &Path, now: DateTime<Utc>) -> Result<PathBuf> {
-    let dest = path.with_extension(format!("json.corrupt-{}", now.format("%Y%m%dT%H%M%SZ")));
+    let base = format!("json.corrupt-{}", now.format("%Y%m%dT%H%M%SZ"));
+    // duas quarentenas no mesmo segundo não podem sobrescrever a cópia anterior
+    let dest = (0..)
+        .map(|n| {
+            path.with_extension(if n == 0 {
+                base.clone()
+            } else {
+                format!("{base}-{n}")
+            })
+        })
+        .find(|d| !d.exists())
+        .expect("iterador infinito");
     std::fs::rename(path, &dest)
         .with_context(|| format!("could not move {} aside", path.display()))?;
     Ok(dest)
@@ -217,6 +228,21 @@ mod tests {
         let moved = quarantine(&p.sessions_file(), Utc::now()).unwrap();
         assert!(moved.exists() && !p.sessions_file().exists());
         upsert(&p, &PrKey::new("o/r", 1), entry("s")).unwrap();
+    }
+
+    #[test]
+    fn two_quarantines_in_the_same_second_keep_both_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::from_home(dir.path().into());
+        std::fs::create_dir_all(&p.state_dir).unwrap();
+        let now = Utc::now();
+        std::fs::write(p.sessions_file(), "primeira").unwrap();
+        let a = quarantine(&p.sessions_file(), now).unwrap();
+        std::fs::write(p.sessions_file(), "segunda").unwrap();
+        let b = quarantine(&p.sessions_file(), now).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "primeira");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "segunda");
     }
 
     #[test]
