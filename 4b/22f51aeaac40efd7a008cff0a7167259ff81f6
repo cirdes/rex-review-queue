@@ -1,0 +1,19 @@
+src/status.rs
+  s_5646e20598039d::t_5878f991d85652 76-77,120
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4b22f51aeaac40efd7a008cff0a7167259ff81f6",
+  "prompts": {},
+  "sessions": {
+    "s_5646e20598039d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "14e3aea6-0f9d-42c4-b672-15c4baacdb8d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Cirdes <cirdes@linkana.com>"
+    }
+  }
+}
