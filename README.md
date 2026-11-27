@@ -1,235 +1,368 @@
-# herdr-reviewq
+# rrq (rex-review-queue)
 
-![The reviewq panel in herdr](assets/tui.svg)
+O `rrq` transforma a sua fila de reviews do GitHub em worktrees prontas para usar no [Rex](https://www.superlogical.com/rex).
 
-A macOS daemon that turns your GitHub review queue into ready-to-use [herdr](https://herdr.dev) workspaces.
+Quando alguém pede a sua review num pull request, o daemon cria uma git worktree para o PR e roda os comandos de setup do repo (`mise install`, `bundle install`, `pnpm install` e assim por diante). Um painel no terminal mostra a fila e avisa no Rex quando a worktree fica pronta. Com Enter, o app do Rex no MacBook troca para uma sessão com um shell na worktree. Com `c`, a sessão ganha o Claude e o reviewr ao lado. Quando o PR sai da fila (você revisou, ou ele foi fechado ou mergeado), o daemon espera uma carência, fecha a sessão se ninguém estiver usando e remove a worktree, mas só se você nunca mexeu nela.
 
-When someone requests your review on a pull request, reviewq creates a git worktree for the PR, opens it as a herdr workspace and runs the repo's setup commands (`mise install`, `bundle install`, `pnpm install`, and so on). You get a notification when the worktree is ready. Once the PR leaves your queue (you reviewed it, or it was closed or merged), reviewq waits for a grace period and then removes the worktree, but only if you never touched it.
+O `rrq` é o sucessor do herdr-reviewq, que fazia o mesmo sobre o Herdr.
 
-A herdr plugin adds a panel that shows your pending reviews, the state of each worktree, the CI of each PR and how many reviews you did today. It also lists the pull requests you opened and how many you opened in the last 24 hours.
+## Onde cada parte roda
 
-## How it works
-
-- **What it tracks.** Pull requests where your review was requested directly. It ignores drafts (a draft joins the queue once it is marked ready for review), PRs from forks and requests made only to a team you belong to.
-- **Polling.** The daemon checks GitHub through the `gh` CLI every `poll_interval_secs` (60 s by default).
-- **New request.** It creates a worktree on the PR's branch, opens a herdr workspace for it and runs the setup steps. Each step has its own timeout, and the output is saved to a redacted per-PR log.
-- **New commits.** When the PR gets new commits, it updates the worktree with `git reset --keep`, which refuses to overwrite local changes.
-- **PR leaves your queue.** It waits `remove_grace_secs` (15 min by default), then removes the worktree and the local branch it created. If the review is requested again later, the worktree comes back.
-- **Work started.** When a Claude or Codex session opens inside a review worktree, reviewq records the time and the agent. herdr doesn't report when an agent started, so the time is the first check (every `poll_interval_secs`) that saw it. This is informational only: it doesn't protect the worktree from removal.
-- **CI, stacks and your PRs.** Every `poll_interval_secs` reviewq also reads the CI status of each tracked PR, the open PRs of each repo (number and branches, to detect stacked PRs), your open PRs in the configured repos and how many PRs you created in the last 24 hours. This runs after the review sync, in a separate step with a 30-second budget, and it never changes worktrees: if GitHub or herdr fail here, the review queue is unaffected. CI is always the status of the PR's latest commit on GitHub, which may differ from what's checked out locally.
-- **Your own work is safe.** If you commit, switch branches or edit files in a worktree, reviewq leaves it in place and shows an alert in `status`. Worktrees you moved to another branch are marked as *adopted*. You can also adopt a worktree yourself before you start working in it. Adopted worktrees are never removed automatically.
-
-## Requirements
-
-- macOS (the daemon runs as a launchd LaunchAgent)
-- [herdr](https://herdr.dev) 0.9.3 or newer, or the Herdr desktop app (see [Herdr desktop app](#herdr-desktop-app))
-- The [GitHub CLI](https://cli.github.com), authenticated: `gh auth login`, then `gh auth setup-git`
-- Rust and cargo, only to build from source
-- A local clone of every repo you review
-- Whatever your setup commands need, for example [mise](https://mise.jdx.dev)
-
-## Install
-
-1. Install the plugin. The install downloads the binary for your Mac from the GitHub release and puts it at `~/.local/bin/herdr-reviewq`:
-
-   ```sh
-   herdr plugin install cirdes/herdr-reviewq
-   ```
-
-2. Create the config. The install leaves the example next to where the config goes:
-
-   ```sh
-   cp ~/.config/herdr-reviewq/config.example.toml ~/.config/herdr-reviewq/config.toml
-   ```
-
-   In `[[repos]]`, set each repo's `name` (`owner/repo`), the `path` to your local clone and its `setup` commands.
-
-   In `disposable_ignored`, list the ignored paths your setup creates (such as `node_modules`, `vendor/bundle`, or `.husky/_` when the install runs husky). These are the only ignored files reviewq may delete along with a worktree.
-
-   Unknown config keys are an error.
-
-3. Start the daemon. This registers and starts the LaunchAgent:
-
-   ```sh
-   ~/.local/bin/herdr-reviewq service install
-   ```
-
-To update, reinstall the plugin. With the daemon installed, the install restarts it on the new binary:
-
-```sh
-herdr plugin uninstall cirdes.reviewq && herdr plugin install cirdes/herdr-reviewq
+```text
+ macmini                                             MacBook
+┌────────────────────────────────────────────┐      ┌──────────────────────┐
+│ LaunchAgent com.cirdes.rrq (rrq daemon)    │      │ Rex.app, conectado   │
+│   GitHub (gh) → worktrees → setup          │      │ ao host macmini      │
+│   state.json, sessions.json                │      │                      │
+│                                            │      │                      │
+│ Rex.app (servidor Rex, login item)         │      │                      │
+│   sessão "reviews": bloco com `rrq tui` ───┼─────►│ indicador na aba     │
+│   sessões "#123 repo", uma por PR aberto ◄─┼──────┤ Enter troca a tela   │
+└────────────────────────────────────────────┘      └──────────────────────┘
 ```
 
-A panel that is already open keeps running the old binary until you close its pane and open the panel again.
+O daemon e o painel rodam no macmini e falam com o servidor Rex de lá pelo CLI `rex`. O MacBook só mostra: o app do Rex se conecta ao host `macmini`, e o painel pede a ele que troque de sessão (`client.perform session.select`).
 
-### From source
+## Como funciona
 
-To run your own build, create the config as in step 2 (copy `config.example.toml` from the clone), then:
+- **O que entra na fila.** PRs em que a sua review foi pedida diretamente. Ficam de fora os drafts (entram quando saem de draft), os PRs de forks e os pedidos feitos só a um time do qual você faz parte.
+- **Consulta.** O daemon consulta o GitHub pelo `gh` a cada `poll_interval_secs` (60 s por padrão).
+- **Pedido novo.** Cria uma worktree na branch do PR e roda os passos de setup. Cada passo tem timeout próprio, e a saída vai para um log por PR, com segredos mascarados. A sessão do Rex não é criada aqui: ela nasce no primeiro Enter ou `c` no painel.
+- **Commits novos.** A worktree é atualizada com `git reset --keep`, que se recusa a sobrescrever mudanças locais.
+- **PR sai da fila.** O daemon espera `remove_grace_secs` (15 min por padrão), fecha a sessão do PR se ela estiver ociosa (ver [Sessão em uso](#sessão-em-uso)) e remove a worktree e a branch local que ele criou. Se a review for pedida de novo, a worktree volta.
+- **Início do trabalho.** Quando o Claude ou o Codex aparece em foreground na sessão de um PR, com o diretório dentro da worktree, o daemon grava a hora e o agente. A conferência roda a cada `poll_interval_secs`, então a hora é a da primeira conferência que viu o agente. É só informativo e não protege a worktree da remoção.
+- **CI, pilhas e os seus PRs.** A cada consulta, o daemon também lê o CI de cada PR da fila, os PRs abertos de cada repo (para achar PRs empilhados), os seus PRs abertos e quantos você abriu nas últimas 24 horas. Isso roda depois da fila, com um orçamento de 30 segundos, e nunca mexe em worktrees: se o GitHub ou o Rex falharem aqui, a fila não é afetada.
+- **O seu trabalho fica a salvo.** Se você commitar, trocar de branch ou editar arquivos numa worktree, o `rrq` deixa a worktree onde está e mostra um alerta. Uma worktree que você trocou de branch fica *adotada*. Você também pode adotar uma worktree antes de começar a mexer nela. Worktree adotada nunca é removida sozinha.
+
+## Requisitos
+
+No macmini:
+
+- macOS (o daemon roda como LaunchAgent do launchd).
+- Rex.app instalado e aberto como login item, porque é ele que mantém o servidor Rex no ar. Sem auto-login, o servidor só volta depois de um reboot quando alguém faz login na máquina (ver [Passos manuais no macmini](#passos-manuais-no-macmini)).
+- O CLI do Rex em `~/.local/bin/rex`, com API revision 24 ou mais nova. O daemon recusa subir com uma revision mais antiga, e o `rrq doctor` aponta a falha.
+- O [GitHub CLI](https://cli.github.com) autenticado: `gh auth login` e depois `gh auth setup-git`.
+- Um clone local de cada repo que você revisa.
+- O que os comandos de setup precisarem, por exemplo o [mise](https://mise.jdx.dev).
+- Para o `c`: o `claude` e a build do reviewr para Rex em `~/.local/bin/reviewr` (ou em outro diretório do PATH do LaunchAgent).
+- Rust e cargo, só para compilar do código.
+
+No MacBook:
+
+- Rex.app conectado ao host `macmini` (palette: "Connect Host…"). O app precisa ter o label `macbook`, ou o label que você puser em `[rex] app_label`.
+
+## Instalação
+
+1. **Binário.** Baixe a build mais nova da `main` (troque o target por `x86_64-apple-darwin` num Mac Intel):
+
+   ```sh
+   target=aarch64-apple-darwin
+   cd "$(mktemp -d)"
+   gh release download main-build --repo cirdes/rex-review-queue --pattern "rrq-$target.tar.gz*"
+   shasum -a 256 -c "rrq-$target.tar.gz.sha256"
+   tar -xzf "rrq-$target.tar.gz"
+   mkdir -p ~/.local/bin && mv rrq ~/.local/bin/rrq
+   ```
+
+   Para usar uma build sua, compile no clone (`cargo build --release`) e rode `./target/release/rrq start` no passo 3: o `start` copia o binário para `~/.local/bin/rrq`.
+
+2. **Config.** Copie o exemplo para `~/.config/rrq/config.toml`:
+
+   ```sh
+   mkdir -p ~/.config/rrq
+   gh api repos/cirdes/rex-review-queue/contents/config.example.toml \
+     -H "Accept: application/vnd.github.raw" > ~/.config/rrq/config.toml
+   ```
+
+   - Em `[[repos]]`, ponha o `name` de cada repo (`owner/repo`), o `path` do clone local e os comandos de `setup`.
+   - Em `disposable_ignored`, liste os caminhos ignorados pelo git que o setup cria (como `node_modules`, `vendor/bundle` ou `.husky/_` quando o install roda o husky). São os únicos arquivos ignorados que o `rrq` pode apagar junto com uma worktree.
+   - `[rex]` e `[combo]` já vêm com padrões que servem na maioria dos casos. `[rex] bin` é o caminho absoluto do CLI `rex` (o LaunchAgent não herda o PATH do shell). `[combo]` define o que o `c` abre; `{worktree}` vira o caminho da worktree. Não ponha segredos no `[combo]`: os comandos aparecem no argv e no bloco.
+   - Chave desconhecida na config é erro.
+
+3. **Daemon.** Registre e inicie o LaunchAgent, e confira o resultado:
+
+   ```sh
+   ~/.local/bin/rrq start
+   ~/.local/bin/rrq doctor
+   ```
+
+   O `doctor` imprime uma linha por checagem. Cada falha vem com a correção sugerida, e o comando sai com código 1 se alguma falhar.
+
+4. **Painel.** No MacBook, crie uma vez uma sessão `reviews` no host `macmini` e rode nela:
+
+   ```sh
+   rrq tui
+   ```
+
+   O daemon não abre nem reabre o painel. Depois de um reboot do macmini, ou se o painel cair, rode `rrq tui` de novo nessa sessão.
+
+## Atualização
+
+Cada push na `main` publica uma build nova na release `main-build` do GitHub. Nada é instalado sem você pedir:
 
 ```sh
-cargo build --release
-./target/release/herdr-reviewq service install
-herdr plugin link /path/to/herdr-reviewq
+rrq update --check   # só diz se há build nova
+rrq update           # baixa, confere o checksum, troca o binário e reinicia o daemon
 ```
 
-`service install` copies the binary to `~/.local/bin/herdr-reviewq`, which the plugin runs. `plugin link` skips the download and points at your working tree. If you check out a branch that lacks `herdr-plugin.toml` or `bin/herdr-reviewq`, the panel and actions break; run `herdr plugin link` again after switching back. To update, pull, build and run `service install` again.
+Uma vez por dia o daemon compara o SHA da build instalada com o da `main-build`, e o rodapé do painel avisa quando há build nova. Um painel aberto continua no binário antigo até você sair dele e rodar `rrq tui` de novo, e o rodapé também avisa isso. `rrq --version` mostra a versão e o SHA do commit.
 
-### Releasing
+### Release
 
-Releases are automatic. Every merge to `main` that changes the binary or the plugin (`src/`, `Cargo.*`, `bin/`, `herdr/`, `herdr-app/`, `herdr-plugin.toml`, `config.example.toml`) runs the release workflow, which:
+O workflow `.github/workflows/release.yml` roda a cada push na `main`. Ele compila os dois targets do Mac, gera `rrq-<target>.tar.gz` com o `.sha256` ao lado, grava o `version.txt` com o SHA do commit e troca os assets da prerelease `main-build`, criando a release se ela não existir. Os tarballs sobem antes do `version.txt`, então quem vê o SHA novo já acha os binários. Cada tarball tem atestação de proveniência: `gh attestation verify <arquivo> --repo cirdes/rex-review-queue`.
 
-1. bumps the patch version in `Cargo.toml`, `Cargo.lock` and `herdr-plugin.toml` and commits it to `main` as `chore: release vX.Y.Z`;
-2. tags that commit;
-3. builds both Mac binaries, attaches them with their checksums and publishes the release once both are up.
+A release se chama `main-build`, e não `main`, porque a tag dela teria o mesmo nome do branch e o git passaria a achar `main` ambíguo.
 
-Merges that only touch docs don't release. For a minor or major release, set the new version in `Cargo.toml` and `herdr-plugin.toml` in the PR (a test keeps them equal): when that version has no tag yet, the workflow tags it as is instead of bumping. Pull after a release, since the bump commit lands on `main`.
+## Comandos
 
-The install downloads the release whose tag matches the manifest version. Pushing a `v*` tag by hand still publishes that tag, as long as it matches the manifest.
+| Comando | O que faz |
+|---|---|
+| `rrq start` | Copia o binário para `~/.local/bin/rrq`, grava o LaunchAgent `com.cirdes.rrq` e inicia o daemon. Recusa enquanto o LaunchAgent do herdr-reviewq estiver carregado. |
+| `rrq stop` | Para o daemon e remove o LaunchAgent. |
+| `rrq restart` | Reinicia o daemon, por exemplo depois de editar a config. |
+| `rrq status` | Estado dos LaunchAgents, PRs da fila com CI, início e pilha, contagem do dia, PRs abertos nas últimas 24 horas, os seus PRs e os alertas. Um PR retido por sessão em uso aparece como `removing · session busy <tempo>`. |
+| `rrq tui` | Abre o painel no bloco atual do Rex. |
+| `rrq doctor` | Confere a config, o LaunchAgent antigo, o CLI e o servidor do Rex, a API revision, o app com o label configurado, os comandos do combo no PATH do LaunchAgent e as sessões de PR fora do `sessions.json`. Só lê: não cria sessão, não troca a tela do MacBook e não fecha nada. |
+| `rrq update [--check]` | Ver [Atualização](#atualização). |
 
-## The panel
+Comandos de apoio, que não aparecem na ajuda:
 
-The daemon opens a `reviewq` workspace with the panel every time it starts. herdr actions are available for keyboard shortcuts:
+| Comando | O que faz |
+|---|---|
+| `rrq request sync` | Consulta o GitHub agora. |
+| `rrq request retry --pr owner/repo#123` | Roda de novo um setup que falhou, ou recria uma worktree que sumiu (só worktrees gerenciadas). |
+| `rrq request adopt --pr owner/repo#123` | Marca a worktree como sua antes de você mexer nela. |
+| `rrq request release --pr owner/repo#123` | Devolve uma worktree adotada. Só funciona se ela estiver limpa e com tudo enviado. Depois que o PR é mergeado ou fechado, commits que nunca chegaram ao origin não impedem a devolução: ficam em `refs/reviewq/backup/pr-<n>/` por 14 dias, e o resultado avisa. A sessão do PR é fechada se estiver ociosa; se estiver em uso, ela fica aberta. |
+| `rrq request release-all` | Devolve todas as worktrees adotadas. As que não estão limpas ou enviadas ficam, e o resultado lista quais. |
+| `rrq daemon` | O daemon em si. Quem roda é o launchd. |
 
-| Action | Command | What it does |
+Os arquivos ficam em:
+
+- `~/.config/rrq/config.toml`: a config.
+- `~/.local/state/rrq/`: `state.json`, `sessions.json` (PR → sessão do Rex), `daemon.log`, `locks/` e, em `logs/`, um log de setup por PR e o `tui.log` do painel.
+
+## Painel
+
+```text
+ reviewq   sync 0s
+┌Pending─────┐┌Done today────┐┌Opened 24h────┐
+│ 4          ││ –            ││ –            │
+└────────────┘└──────────────┘└──────────────┘
+  PR     State                         CI         Start  Author          Stacked Title
+ Started
+▸ #812 ● ready                                    15:16  bia             No      Corrige o cálculo do frete
+ Pending
+  #818 ✗ failed · pnpm install                    –      edu             No      Migra a tela de pedidos
+  #817 ◐ preparing                                –      duda            No      Atualiza dependências
+  #815 ● ready                                    –      caio            No      Adiciona filtro por categoria
+ Leaving
+  #801 ○ removing · session busy 25min            –      caio            No      Remove código morto
+
+ / search · enter open · c combo · f next · o GitHub · l log · s sync · R retry · a adopt · r release · X rele
+```
+
+A lista tem estas seções, nesta ordem: **Started** (reviews pendentes em que um agente já foi aberto, as mais recentes primeiro), **Pending**, **My PRs** (os seus PRs abertos, os mais novos primeiro), **Adopted**, **No sync** e **Leaving**. Os contadores mostram as reviews pendentes, as reviews feitas hoje e os PRs que você abriu nas últimas 24 horas (`?` quando algum repo está faltando ou desatualizado).
+
+### Colunas
+
+| Coluna | O que mostra |
+|---|---|
+| `PR` | O número do PR (`#123`), ou `owner/repo#123` quando a config tem mais de um repo. |
+| ícone | A worktree: `●` pronta, `◐` sendo criada ou preparada, `✗` setup falhou, `⊘` bloqueada, `○` sendo removida, `◆` adotada por você. Em **My PRs**, é o ícone do CI. |
+| `State` | O estado da worktree por extenso (`ready`, `preparing`, `failed · <passo>`, `blocked · <motivo>`, `removing`), com detalhe onde importa: `leaves in Nmin` para um PR saindo da fila, `removing · session busy <tempo>` quando a sessão em uso segura a remoção, `yours · <motivo>` para uma worktree adotada, `GitHub not synced` quando a última consulta daquele repo falhou. Em **My PRs**: `open` ou `draft`. |
+| `CI` | O CI do último commit do PR no GitHub: `◐` rodando, `✓` passou e há quanto tempo, `✗` falhou e o primeiro check que falhou, `?` desconhecido para o commit atual, vazio antes da primeira coleta. |
+| `Start` | Quando você começou: a primeira vez que um agente (Claude ou Codex) foi visto na sessão do PR, como `HH:MM` hoje ou `Mon DD` (por exemplo `Nov 18`) em outros dias. `–` até isso acontecer. Não é a idade do PR. |
+| `Author` | O autor do PR. `you` em **My PRs**. Some quando o painel é estreito. |
+| `Stacked` | Se o PR está empilhado: `No`, ou `#<PR da base> i/n` com a posição na pilha. Um PR está empilhado quando a base dele é a branch de outro PR aberto no repo. Some antes do `Author` quando o painel é estreito. |
+| `Title` | O título do PR, com a largura que sobrar. |
+
+### Teclas
+
+| Tecla | O que faz |
+|---|---|
+| `↑` `↓` / `k` `j` | Move a seleção. |
+| `/` | Busca (ver [Busca](#busca)). |
+| `enter` | Troca o app do MacBook para a sessão do PR. Na primeira vez, cria a sessão `#123 repo` (ou `owner/repo#123` com repos de mais de um dono) com um shell na worktree. Se a sessão foi fechada à mão, cria de novo. Funciona em qualquer fase com worktree, menos enquanto ela é criada ou removida. Num PR seu (**My PRs**), vai para a worktree onde a branch do PR está, ou cria uma em `worktrees_dir/<owner>/<repo>/mine-pr-<n>`. |
+| `c` | Faz o mesmo que o Enter e abre o combo: o `claude` à direita do shell e o reviewr à direita do `claude`, com 55% da largura dos dois. Bloco que já existe com o programa rodando fica como está; bloco cujo programa saiu ganha o comando de novo. Repetir o `c` nunca duplica blocos, e um `c` que falhou no meio é completado pelo seguinte. O foco termina no `claude`. |
+| `f` | Vai para a review pronta mais antiga, como o Enter. |
+| `o` | Copia a URL do PR para o clipboard do MacBook (OSC 52). |
+| `l` | Abre o log de setup do PR num bloco à direita do painel, com `less +F`. |
+| `s` | Consulta o GitHub agora. |
+| `R` | Tenta de novo (só worktrees gerenciadas, com setup falho ou worktree ausente). |
+| `a` | Adota a worktree (pede `y`/`n`). |
+| `r` | Devolve uma worktree adotada (pede `y`/`n`). |
+| `X` | Devolve todas as worktrees adotadas (pede `y`/`n`). As que têm trabalho não commitado, ou não enviado num PR ainda aberto, ficam, e a linha de resultado lista quais. |
+| `q` / `esc` / `ctrl+c` | Sai. Com uma busca ativa, `esc` limpa a busca. |
+
+Em **My PRs**, só `enter` e `o` fazem algo. Uma worktree criada pelo Enter num PR seu é sua: o `rrq` não roda o setup nela, não acompanha e nunca remove. Se a branch já existe localmente, ela é usada como está; senão, começa em `origin/<branch>` com o upstream configurado.
+
+O Enter leva cerca de 100 ms quando a sessão já existe e até uns 300 ms quando precisa criá-la. O `tui.log` registra a duração de cada Enter. Sem o app com o label configurado conectado, o Enter avisa e não troca a tela de nenhum outro app.
+
+### Busca
+
+`/` filtra a lista enquanto você digita. Só as linhas que batem ficam, ainda agrupadas nas seções, e o rodapé mostra quantas (`/eng-4321▏ (2 of 23)`).
+
+- **Onde procura:** número do PR (`123` ou `#123`), repo, autor, título e branch. A branch costuma ter o ID da issue do Linear (`alice-eng-4321-fix`), então `eng-4321` acha o PR mesmo que o título não cite a issue.
+- **Como compara:** aproximado, sem diferenciar maiúsculas nem acentos. Uma palavra bate com um campo quando as letras dela aparecem ali na ordem, com buracos permitidos: `crimp` acha "Correct importation". As letras precisam vir do mesmo campo. Várias palavras precisam bater todas: `alice tela`.
+- **Ordem:** dentro de cada seção, os melhores resultados primeiro. Um trecho exato vale mais do que letras espalhadas.
+- **Enquanto digita,** toda letra vai para a busca (`q`, `s`, `a` não disparam ações). `↑` `↓` movem a seleção, `backspace` apaga, `ctrl+u` limpa, `enter` mantém o filtro e devolve as teclas, `esc` limpa.
+- **Com o filtro mantido,** a linha do topo mostra `search "<texto>": n of m`. O filtro sobrevive às atualizações da lista; `/` edita e `esc` limpa. Os contadores ignoram o filtro.
+
+## Status nativo
+
+O painel avisa o MacBook pelo protocolo de status do Rex (OSC 7501). Todos os avisos acabam num único indicador, na aba da sessão `reviews` na sidebar do MacBook. O indicador só aparece quando a aba está fora de foco.
+
+- **Raiz (`reviewq`):** fica `error` enquanto houver uma condição ativa e volta a `idle` quando ela some. As condições são: `gh` sem autenticação, algum repo com a última consulta falha e `sessions.json` corrompido. Com mais de uma, a mensagem mostra a primeira nessa ordem.
+- **Um registro por PR:**
+  - criando ou preparando a worktree: `working`;
+  - pronta e você ainda não entrou: `done`, "Review pronta: <título>";
+  - setup falhou: `error`, com o passo;
+  - bloqueada (o daemon parou de mexer na worktree por um motivo que exige você): `blocked`;
+  - você entrou, o PR saiu da fila ou foi removido: o registro some.
+- Ao abrir, o painel limpa tudo e emite de novo a partir do estado.
+- O Rex decide quando apagar um `done`, por exemplo quando você aperta uma tecla na aba. O painel continua mostrando o PR como `● ready`.
+- Só um painel emite. Um segundo `rrq tui` aberto ao mesmo tempo funciona, mas não emite status, e o rodapé dele avisa isso.
+- Sair com `q`, `esc` ou `ctrl+c` limpa o indicador. Se o painel cair (erro ou pânico), ele deixa um `error` com o motivo. O bloco continua no shell, e `rrq tui` de novo limpa o aviso.
+
+Com o painel fechado, os avisos não chegam ao MacBook. O estado continua sendo atualizado e tudo aparece quando o painel abre de novo.
+
+## Sessão em uso
+
+Quando a carência de um PR que saiu da fila acaba, o daemon fecha a sessão do PR antes de remover a worktree, mas só se ela estiver ociosa. Ociosa quer dizer que, em todos os blocos, o processo em foreground é um shell parado no prompt, com o diretório dentro da worktree.
+
+- Se algum bloco tem outro programa em foreground (o Claude, um `vim`, um servidor), a sessão está em uso. O PR fica em `removing`, o painel e o `rrq status` mostram `session busy <tempo>`, e o daemon tenta de novo a cada consulta.
+- Para liberar, feche o programa ou a sessão. A remoção acontece na consulta seguinte.
+- Uma sessão fechada à mão, ou que sumiu, não impede nada: o daemon segue para a remoção.
+- O daemon só fecha sessões que estão no `sessions.json`, ou seja, as que o painel criou. Sessões criadas à mão nunca são fechadas. Se o `sessions.json` se perder, o `rrq doctor` lista as sessões `#<n> <repo>` que ficaram de fora, para você fechar.
+- Uma worktree que mudou enquanto a sessão era fechada fica no lugar, como adotada.
+- A regra só olha o foreground. Um job em background num shell não segura a remoção e morre junto com a sessão.
+
+## Migração do herdr-reviewq
+
+Não há comando de importação. O `state.json` é compatível nos dois sentidos: o `rrq` lê o estado do herdr-reviewq e o herdr-reviewq lê o estado do `rrq`. No macmini:
+
+1. Pare o daemon antigo:
+
+   ```sh
+   herdr-reviewq service uninstall
+   ```
+
+2. Copie o estado:
+
+   ```sh
+   mkdir -p ~/.local/state/rrq
+   cp ~/.local/state/herdr-reviewq/state.json ~/.local/state/rrq/
+   ```
+
+3. Copie a config e tire as chaves do Herdr (`herdr_session`, `backend`, `window` e a seção `[notify]`). Acrescente `[rex]` e `[combo]` só se os padrões não servirem:
+
+   ```sh
+   mkdir -p ~/.config/rrq
+   cp ~/.config/herdr-reviewq/config.toml ~/.config/rrq/
+   ```
+
+   Se sobrar alguma chave antiga, o `rrq` recusa a config e o `rrq doctor` aponta cada uma pelo nome.
+
+4. Instale o binário (ver [Instalação](#instalação)) e inicie o daemon:
+
+   ```sh
+   rrq start
+   ```
+
+5. Confira:
+
+   ```sh
+   rrq doctor
+   ```
+
+Um PR cuja worktree não existe mais continua no estado e é tratado como worktree ausente (`R` recria). O `rrq start` e o daemon recusam rodar enquanto o LaunchAgent `dev.cirdes.herdr-reviewq` estiver carregado, e o `rrq doctor` aponta isso como falha. Assim os dois daemons nunca mexem nas mesmas worktrees.
+
+### Rollback
+
+É o caminho inverso, levando de volta o `state.json` **atual** do `rrq`, e não uma cópia de antes da troca. Assim as worktrees criadas ou adotadas depois do corte não se perdem.
+
+```sh
+rrq stop
+cp ~/.local/state/rrq/state.json ~/.local/state/herdr-reviewq/
+herdr-reviewq service install
+```
+
+A config antiga continua em `~/.config/herdr-reviewq/` se você copiou em vez de mover. As sessões do Rex abertas pelo `rrq` não são fechadas pelo herdr-reviewq: feche à mão as que não quiser mais.
+
+## Linha de base do tempo até a worktree pronta
+
+Antes da troca, meça a mediana dos últimos 30 dias no `daemon.log` do herdr-reviewq e anote aqui. Depois de uma semana de uso, rode o mesmo cálculo no log do `rrq` e compare. O cálculo pega, para cada PR, o tempo entre o início do setup e a worktree pronta:
+
+```sh
+cat > /tmp/rrq-baseline.py <<'EOF'
+import re, sys, statistics
+from datetime import datetime, timedelta
+start, durs = {}, []
+limit = datetime.now() - timedelta(days=30)
+for line in open(sys.argv[1], errors="replace"):
+    m = re.match(r"(\S+ \S+) (\S+#\d+): (setup iniciado|pronto|ready)$", line.rstrip("\n"))
+    if not m:
+        continue
+    at = datetime.strptime(m[1], "%Y-%m-%d %H:%M:%S")
+    if at < limit:
+        continue
+    if m[3] == "setup iniciado":
+        start[m[2]] = at
+    elif m[2] in start:
+        durs.append((at - start.pop(m[2])).total_seconds())
+if durs:
+    print(f"{len(durs)} setups, mediana {statistics.median(durs) / 60:.1f} min")
+else:
+    print("nenhum setup nos últimos 30 dias")
+EOF
+python3 /tmp/rrq-baseline.py ~/.local/state/herdr-reviewq/daemon.log   # antes da troca
+python3 /tmp/rrq-baseline.py ~/.local/state/rrq/daemon.log             # depois
+```
+
+| Medição | Setups | Mediana |
 |---|---|---|
-| `open` | `herdr-reviewq ui open` | Opens the panel, or recreates it if you closed it |
-| `first-ready` | `herdr-reviewq focus first-ready` | Jumps to the oldest PR that is ready for review |
-| `sync-now` | `herdr-reviewq request sync` | Checks GitHub right away |
-| `release-all` | `herdr-reviewq request release-all` | Releases every adopted worktree; the ones with local work are kept and reported |
+| herdr-reviewq, 30 dias antes da troca | a medir | a medir |
+| `rrq`, primeira semana | a medir | a medir |
 
-The list has these sections, in order: **Started** (pending reviews where an agent was opened, most recent first), **Pending**, **My PRs** (your open PRs, newest first), **Adopted**, **No sync** and **Leaving**. The counters show pending reviews, reviews done today and PRs you opened in the last 24 hours (`?` means some repo is missing or out of date).
+## Passos manuais no macmini
 
-### Columns
+Estes passos ficam fora do repo e são feitos uma vez, à mão:
 
-| Column | What it shows |
-|---|---|
-| `PR` | The PR number (`#123`), or `owner/repo#123` when more than one repo is configured. |
-| icon | The worktree: `●` ready, `◐` being created or set up, `✗` setup failed, `⊘` blocked, `○` being removed, `◆` adopted by you. In **My PRs** it is the CI icon instead. |
-| `State` | The worktree state in words (`ready`, `preparing`, `failed · <step>`, `blocked · <reason>`, `removing`), with extra detail where it matters: `leaves in Nmin` for a PR leaving your queue, `yours · <reason>` for an adopted worktree, `GitHub not synced` when the last sync for that repo failed. In **My PRs**: `open` or `draft`. |
-| `CI` | The CI of the PR's latest commit on GitHub: `◐` running, `✓` passed and how long ago, `✗` failed and the first failing check, `?` not known for the current commit, empty before the first collection. When the check name does not fit the column, words are dropped from the end so the icon of the check survives (`✗ 🌐 System` becomes `✗ 🌐`). |
-| `Start` | When you started working on it: the first time an agent (Claude or Codex) was seen open in the PR's worktree, as `HH:MM` today or `Mon DD` (such as `Nov 18`) on other days. `–` until that happens. It is not the PR's age. |
-| `Author` | The PR author. `you` in **My PRs**. Hidden when the pane is too narrow. |
-| `Stacked` | Whether the PR is stacked: `No`, or `#<bottom PR> i/n` for its position in the stack. A PR is stacked when its base is the branch of another open PR in the repo. The stack is built from all open PRs of the repo, so the numbering stays the same when a PR in the middle or at the bottom leaves your queue; it only changes when a PR is closed or merged. Before the first collection, only the PRs in the list are used, and the cell is empty in **My PRs**. Hidden before `Author` when the pane is too narrow. |
-| `Title` | The PR title, with whatever width is left. |
+1. **Rex.app como login item.** Abra o Rex.app no macmini e adicione-o aos itens de login (Ajustes do Sistema > Geral > Itens de Início). É ele que mantém o servidor Rex no ar.
+2. **Auto-login (decisão pendente).** Sem auto-login, o servidor Rex não volta depois de um reboot até alguém fazer login. Com auto-login, quem tiver acesso físico ao macmini tem uma sessão aberta com o `gh` e as chaves ssh, e o FileVault não pode desbloquear no boot.
+3. **reviewr para Rex** em `~/.local/bin/reviewr`.
+4. **MacBook conectado ao host.** No app do MacBook, conecte o host `macmini` pela palette ("Connect Host…").
+5. **Linha de base.** Meça e anote a [linha de base](#linha-de-base-do-tempo-até-a-worktree-pronta) antes de migrar.
+6. **Migração.** Siga [Migração do herdr-reviewq](#migração-do-herdr-reviewq).
+7. **Roteiro de verificação**, com sessões descartáveis:
+   - `rrq doctor` passa;
+   - um PR de teste fica `● ready` e a aba `reviews` ganha o indicador no MacBook;
+   - Enter troca a tela, e o `tui.log` registra `enter … <500ms` no caso típico;
+   - `c` abre o Claude e o reviewr, um segundo `c` não duplica, e depois de `/exit` no Claude o `c` relança;
+   - a remoção funciona com e sem o Claude aberto, e fechar a sessão à mão libera a remoção;
+   - um setup que falha de propósito aparece como `error`;
+   - `kill -ABRT` no painel deixa um `error` no bloco, e `rrq tui` de novo limpa;
+   - depois de um reboot real do macmini, `rrq tui` na sessão `reviews` volta a funcionar;
+   - depois de um push na `main`, `rrq update --check` mostra o SHA novo e `rrq update` troca o binário e reinicia o daemon.
 
-Columns are laid out by terminal cells, so an emoji in a check name does not shift the columns to its right.
+## Garantias
 
-Quitting the panel (`q`) closes its pane, because the pane ends with its command. The panel always runs the binary installed in `~/.local/bin`. Panel start, exit (key or signal) and errors are logged to `~/.local/state/herdr-reviewq/logs/tui.log`.
+- **Só worktrees intocadas são removidas, e só depois da carência.** Intocada quer dizer:
+  - mesma branch e mesmo commit que o `rrq` fez checkout;
+  - nenhuma mudança em arquivo rastreado e nenhum arquivo novo;
+  - nenhum arquivo ignorado fora de `disposable_ignored`.
+- **Nenhum comando git destrutivo.** O `rrq` nunca roda `reset --hard`, `clean` nem `--force`. As atualizações usam `reset --keep`.
+- **Branches locais só são apagadas quando o `rrq` as criou**, ainda apontam para o commit dele e nenhuma outra worktree está nelas.
+- **Backup antes de mudar.** Antes de qualquer reset ou remoção, o commit anterior vai para `refs/reviewq/backup/pr-<n>/<timestamp>` e fica 14 dias.
+- **Falha não apaga nada.** Uma consulta ao GitHub que falha nunca remove worktree, e uma falha ao gravar o estado interrompe o ciclo.
+- **Sessão em uso não é fechada**, e sessão que o `rrq` não criou nunca é fechada.
+- **O diff bate com o do GitHub.** O `rrq` busca a branch base do PR (para um PR empilhado, a branch do PR de baixo) em `origin/<base>` ao criar a worktree, a cada push do autor e quando o GitHub muda a base do PR. Branches locais, como a `main` do clone, nunca são tocadas, então compare com `origin/<base>`, e não com `main`.
+- **O reviewr abre na base certa.** Em cada worktree, a base fica gravada como a escolha de base do reviewr (ref `refs/worktree/reviewr/base-pick`). Uma base que você escolheu com `B` nunca é sobrescrita.
 
-### Keys
+## Riscos aceitos
 
-| Key | Action |
-|---|---|
-| `↑` `↓` / `k` `j` | Move the selection |
-| `/` | Search: filter the list as you type (see [Search](#search)) |
-| `enter` | Open the PR's workspace (recreated if it was closed). On your own PRs, focus the worktree where the PR's branch is checked out; if there is none, create one at `worktrees_dir/<owner>/<repo>/mine-pr-<n>` and open it in herdr |
-| `o` | Open the PR in the browser on the daemon's machine, and copy the URL through OSC 52 (handy over a remote session) |
-| `l` | Open the PR's setup log |
-| `s` | Sync now |
-| `R` | Retry (managed PRs only, when setup failed or the worktree is missing) |
-| `a` | Adopt the worktree (asks for `y`/`n`) |
-| `r` | Release an adopted worktree (asks for `y`/`n`) |
-| `X` | Release all adopted worktrees at once (asks for `y`/`n`). Worktrees with uncommitted work, or unpushed work on a PR that is still open, are kept, and the result line lists them |
-| `q` / `esc` / `ctrl+c` | Quit. With a search active, `esc` clears it instead |
-
-On your own PRs (**My PRs**) only `enter` and `o` do something; `l`, `R`, `a` and `r` apply to review worktrees. A worktree created by `enter` on your own PR is yours: reviewq doesn't run the repo's setup in it, doesn't track it and never removes it. If the branch already exists locally, it is checked out as it is (never reset to `origin`); otherwise it starts at `origin/<branch>` with the upstream set. The branch comes from the open PRs reviewq collects for stacks, so `enter` only works after the first collection.
-
-### Search
-
-`/` filters the list as you type. Only matching rows stay, still grouped in their sections, and the footer shows how many match (`/eng-4321▏ (2 of 23)`).
-
-- **What it looks at:** the PR number (`123` or `#123`), repo, author, title and branch. The branch is where a Linear issue usually lives (`alice-eng-4321-fix`), so `eng-4321` finds the PR even if the title doesn't mention it. For **My PRs** the branch comes from the open PRs reviewq collects for stacks, so it is unknown until the first collection.
-- **How it matches:** fuzzy, ignoring case and accents. A word matches a field when its letters appear there in order, gaps allowed, so `crimp` finds "Correct importation" and `eng4321` finds `alice-eng-4321-fix`. The letters must all come from the same field: `101alice` doesn't join the number and the author. Several words must all match: `alice tela`.
-- **Order:** inside each section, the best matches come first. An exact piece of text beats scattered letters, and matches at the start of a word or with letters next to each other score more. Ties keep the usual order. A row waiting for `y`/`n` stays at the top of its section even if it doesn't match.
-- **While typing,** every letter goes into the search (`q`, `s`, `a`... don't trigger actions). `↑` `↓` move the selection, `backspace` deletes, `ctrl+u` clears the text, `enter` keeps the filter and gives the keys back, `esc` clears it. Other `ctrl`/`alt` combinations are ignored. A result that arrives while you type (a sync, say) shows on the top line.
-- **With the filter kept,** the top line shows `search "<text>": n of m`. The filter survives list refreshes; `/` edits it and `esc` clears it. The counters (Pending, Done today, Opened 24h) ignore the filter.
-
-## Command line
-
-| Command | What it does |
-|---|---|
-| `herdr-reviewq status` | Pending, ready and adopted PRs with CI, work start and stack position, today's count, PRs opened in the last 24 hours, your open PRs and alerts |
-| `herdr-reviewq request sync` | Check GitHub now |
-| `herdr-reviewq request retry --pr owner/repo#123` | Rerun a failed setup, or recreate a missing worktree (managed worktrees only) |
-| `herdr-reviewq request adopt --pr owner/repo#123` | Mark a worktree as yours before you work in it |
-| `herdr-reviewq request release --pr owner/repo#123` | Hand an adopted worktree back. Only works if it is clean and everything is pushed. Once the PR is merged or closed, commits that never reached origin don't block it: they stay in `refs/reviewq/backup/pr-<n>/` for 14 days and the result says so. |
-| `herdr-reviewq request release-all` | Hand back every adopted worktree. The ones that are not clean or not pushed are kept and listed in the result. |
-| `herdr-reviewq service restart` | Restart the daemon, for example after editing the config |
-| `herdr-reviewq service uninstall` | Remove the LaunchAgent |
-
-Logs live in `~/.local/state/herdr-reviewq/`: `daemon.log`, plus one redacted setup log per PR under `logs/`.
-
-## Herdr desktop app
-
-reviewq also runs on the Herdr desktop app (`herdr-app`, with herdr-core `hc`). By default (`backend = "auto"`) it works out which one you use:
-
-- **The panel and the actions** (`ui open`, `focus first-ready`) look at where they run: `HERDR_ENV=1` means a herdr pane, `HC_TERMINAL_ID` means a herdr-app terminal.
-- **The daemon** runs under launchd, without that environment, so at start it checks, in order: a desktop window listening to this machine (the `reviewq-bridge` mod signalled in the last 2 minutes), then a herdr server that answers, then `herdr-app` on the `PATH`. Both can run on the same machine, so the listening window wins over a herdr server that is merely up. If none of them is there yet (right after login, say), the daemon waits and checks again every 10 seconds. `daemon.log` says which one it picked and why.
-
-The daemon keeps its choice until it restarts, because the workspace ids it stores belong to one backend. If you switch between the two, restart it with `herdr-reviewq service restart`. To skip the detection, set the backend in the config and restart the daemon:
-
-```toml
-backend = "herdr-app" # or "herdr"
-```
-
-A backend set in the config wins everywhere, including in the panel.
-
-Nothing else changes: the daemon, the panel, the keys and the command line are the same. What differs is how each step reaches Herdr:
-
-- **Workspaces are spaces, created by herdr-core.** The daemon starts a shell in the worktree with `hc run --label herdr.space=<id>`, so worktrees are prepared even with the window closed; the space shows up when it opens. The id is derived from the worktree path. With the window open, the space is named `#<n> <title>`; otherwise it keeps the folder name.
-- **The panel is the same TUI**, in a `reviewq` space: `herdr-reviewq ui open` (and the daemon at start) runs `herdr-reviewq tui` there. Bind it to a key in `~/.config/herdr-app/keys.json` if you like; `l` opens the setup log in a split below the panel.
-- **Agents** (Claude Code, Codex) are read from `hc ls` and `hc get`.
-- **Notifications** are macOS notifications (`osascript`): the desktop app has no notification command.
-- **Removing a worktree** closes its space and ends its terminals, then runs `git worktree remove` without `--force`, under the same pristine rules.
-
-The herdr plugin (`herdr-plugin.toml`) is not used by the desktop app; there is no need to link it.
-
-### Window on another machine
-
-The daemon can run on a machine that the window only connects to, such as a Mac mini added with `hc machine add` from your laptop. That machine has no `herdr-app`, and it can't reach the window: the connection goes from the window to it. reviewq notices on its own: with the desktop app as backend (set or detected) and no `herdr-app` in its `PATH`, it treats the window as remote. To force one mode, set `window = "local"` or `window = "remote"`.
-
-With a remote window, reviewq only talks to the herdr-core of its own machine:
-
-- **Listing, naming and closing spaces** edit the `herdr-app` doc in that core, where the window keeps the machine's spaces. A write only lands if nobody wrote in between; otherwise reviewq reads again and retries.
-- **Focusing a PR** (`enter` in the panel, `focus first-ready`) writes `{ space, at }` to the `reviewq-focus` doc. The `reviewq-bridge` mod, installed in the window, reads that doc on every connected machine once a second and shows the space. A request older than 30 seconds, or made before the mod started, is ignored, so an old one never steals the focus.
-- **The panel's focus is not given back** after it opens: the doc doesn't say which space is shown.
-
-Install the mod on the computer with the window, copying it from the machine that has the repo (here `macmini`; see `hc machine ls`):
-
-```sh
-M=~/.config/herdr-app/mods/reviewq-bridge; mkdir -p "$M"
-for f in main.js mod.json; do
-  hc exec --on macmini cat Workspaces/herdr-reviewq/herdr-app/mods/reviewq-bridge/$f > "$M/$f"
-done
-herdr-app check "$M"
-```
-
-Herdr docks a new mod into the layout on screen, but the shipped layouts (`main` and the others) are read-only, so on one of them the mod never starts. Clone the layout (this also switches to the clone) and add the bar at the end of its `work` column, in `~/.config/herdr-app/layouts/main-reviewq.json`:
-
-```sh
-herdr-app do layout.clone '{"name":"main","as":"main-reviewq"}'
-```
-
-```json
-{ "id": "reviewq-bridge", "type": "block", "size": { "px": 22 }, "content": { "mod": "reviewq-bridge" } }
-```
-
-`herdr-app status` should list the mod with no errors.
-
-The bar shows the machines it listens to and the last space it focused, or the error when a machine can't be read. Every 30 seconds it also writes `{ at }` to the `reviewq-bridge` doc on each machine, so reviewq knows a window is listening:
-
-- If no window ever wrote it, the daemon raises an alert (checked every 5 minutes, once until it's fixed).
-- If a focus request finds no recent signal, the panel says so: the request is saved, but the window is closed or doesn't have the mod.
-
-## Safety guarantees
-
-- **Only pristine worktrees are removed, and only after the grace period.** Pristine means:
-  - same branch and commit that reviewq checked out;
-  - no tracked changes and no new files;
-  - no ignored files outside `disposable_ignored`.
-- **No destructive git commands.** reviewq never runs `reset --hard`, `clean` or `--force`. Updates use `reset --keep`.
-- **Local branches are deleted only when reviewq created them**, they still point at reviewq's commit and no other worktree has them checked out.
-- **Backups before changes.** Before any reset or removal, the previous commit is saved under `refs/reviewq/backup/pr-<n>/<timestamp>` and kept for 14 days.
-- **Failures fail safe.** A failed GitHub query never removes anything, and a failure to save state stops the cycle.
-- **Diffs match GitHub's.** reviewq fetches the PR's base branch (`baseRefName`; for a stacked PR, the branch of the PR below it) into `origin/<base>` when it creates the worktree, on every push by the author and whenever GitHub retargets the PR. Local branches, like the clone's `main`, are never touched, so compare against `origin/<base>`, not `main`.
-- **reviewr opens on the right base.** In each worktree, the base is stored as the reviewr base pick (plugin `persiyanov.reviewr`, ref `refs/worktree/reviewr/base-pick`). A base you pick yourself with `B` is never overwritten.
+- **Painel fechado ou caído:** os avisos não chegam ao MacBook até você abrir o painel de novo.
+- **Job em background num shell:** morre quando a sessão é fechada, porque a regra de sessão em uso só olha o foreground. O Herdr fazia o mesmo.
+- **Sessão em uso por muito tempo:** a worktree não é removida enquanto isso. O painel mostra há quanto tempo.
+- **Código de PR controla o app do MacBook:** o setup roda scripts dos PRs com o mesmo usuário do servidor Rex e, por isso, consegue falar com o app do MacBook. Os PRs são de colegas e os de forks são ignorados.
+- **Rex em preview:** uma atualização do Rex pode mudar a API. O daemon e o `doctor` conferem a API revision mínima, e os testes usam respostas capturadas da revision 24.
