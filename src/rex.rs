@@ -150,36 +150,30 @@ pub fn parse_created(v: &Value) -> MuxResult<Created> {
     })
 }
 
-pub fn parse_view(v: &Value) -> Vec<BlockInfo> {
-    let mut out = vec![];
-    for w in v
-        .get("windows")
+fn arr<'v>(v: &'v Value, k: &str, what: &str) -> MuxResult<&'v Vec<Value>> {
+    v.get(k)
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        for l in w
-            .get("layers")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            for b in l
-                .get("blocks")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                if let Some(id) = b.get("block_id").and_then(Value::as_str) {
-                    out.push(BlockInfo {
-                        id: id.into(),
-                        label: b.get("label").and_then(Value::as_str).map(String::from),
-                    });
-                }
+        .ok_or_else(|| MuxError::Other(format!("rex: {what} without {k}")))
+}
+
+/// Blocos da sessão. Resposta fora do formato é erro, nunca "sessão sem blocos": quem fecha
+/// sessões não pode confundir uma resposta que não entendeu com uma sessão vazia.
+pub fn parse_view(v: &Value) -> MuxResult<Vec<BlockInfo>> {
+    let mut out = vec![];
+    for w in arr(v, "windows", "session.view")? {
+        for l in arr(w, "layers", "session.view window")? {
+            for b in arr(l, "blocks", "session.view layer")? {
+                let id = b.get("block_id").and_then(Value::as_str).ok_or_else(|| {
+                    MuxError::Other("rex: session.view block without block_id".into())
+                })?;
+                out.push(BlockInfo {
+                    id: id.into(),
+                    label: b.get("label").and_then(Value::as_str).map(String::from),
+                });
             }
         }
     }
-    out
+    Ok(out)
 }
 
 pub fn parse_process(v: &Value) -> Option<Process> {
@@ -197,19 +191,41 @@ pub fn parse_process(v: &Value) -> Option<Process> {
     })
 }
 
-pub fn parse_apps(v: &Value) -> Vec<ClientInfo> {
-    v.get("clients")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|c| c.pointer("/info/kind").and_then(Value::as_str) == Some("app"))
-        .filter_map(|c| {
-            Some(ClientInfo {
-                id: c.get("client_id")?.as_str()?.into(),
-                label: c
-                    .pointer("/info/label")
+pub fn parse_apps(v: &Value) -> MuxResult<Vec<ClientInfo>> {
+    let mut out = vec![];
+    for c in arr(v, "clients", "client.list")? {
+        if c.pointer("/info/kind").and_then(Value::as_str) != Some("app") {
+            continue;
+        }
+        let id = c
+            .get("client_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| MuxError::Other("rex: client.list entry without client_id".into()))?;
+        out.push(ClientInfo {
+            id: id.into(),
+            label: c
+                .pointer("/info/label")
+                .and_then(Value::as_str)
+                .map(String::from),
+        });
+    }
+    Ok(out)
+}
+
+pub fn parse_sessions(v: &Value) -> MuxResult<Vec<SessionInfo>> {
+    arr(v, "sessions", "session.list")?
+        .iter()
+        .map(|x| {
+            let id = x.get("session_id").and_then(Value::as_str).ok_or_else(|| {
+                MuxError::Other("rex: session.list entry without session_id".into())
+            })?;
+            Ok(SessionInfo {
+                id: id.into(),
+                label: x
+                    .get("label")
                     .and_then(Value::as_str)
-                    .map(String::from),
+                    .unwrap_or_default()
+                    .into(),
             })
         })
         .collect()
@@ -225,22 +241,7 @@ impl Mux for RexCli<'_> {
     }
 
     fn list_sessions(&self) -> MuxResult<Vec<SessionInfo>> {
-        let v = self.api("session.list", json!({}))?;
-        Ok(v.get("sessions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|x| {
-                Some(SessionInfo {
-                    id: x.get("session_id")?.as_str()?.into(),
-                    label: x
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .into(),
-                })
-            })
-            .collect())
+        parse_sessions(&self.api("session.list", json!({}))?)
     }
 
     fn create_session(&self, req: &CreateReq) -> MuxResult<Created> {
@@ -248,9 +249,7 @@ impl Mux for RexCli<'_> {
     }
 
     fn view(&self, session: &str) -> MuxResult<Vec<BlockInfo>> {
-        Ok(parse_view(
-            &self.api("session.view", json!({ "session_id": session }))?,
-        ))
+        parse_view(&self.api("session.view", json!({ "session_id": session }))?)
     }
 
     fn destroy_session(&self, session: &str) -> MuxResult<()> {
@@ -284,7 +283,7 @@ impl Mux for RexCli<'_> {
     }
 
     fn apps(&self) -> MuxResult<Vec<ClientInfo>> {
-        Ok(parse_apps(&self.api("client.list", json!({}))?))
+        parse_apps(&self.api("client.list", json!({}))?)
     }
 
     fn select_session(&self, client: &str, session: &str) -> MuxResult<()> {
@@ -354,7 +353,7 @@ mod tests {
         assert_eq!(json_fx("server_version.json")["api_revision"], 24);
         let c = parse_created(&json_fx("session_create.json")).unwrap();
         assert!(c.session_id.starts_with("session:") && c.block_id.starts_with("block:"));
-        let blocks = parse_view(&json_fx("session_view.json"));
+        let blocks = parse_view(&json_fx("session_view.json")).unwrap();
         assert_eq!(
             blocks
                 .iter()
@@ -372,9 +371,44 @@ mod tests {
             None,
             "programa que terminou: sem foreground"
         );
-        let apps = parse_apps(&json_fx("client_list.json"));
+        let apps = parse_apps(&json_fx("client_list.json")).unwrap();
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].label.as_deref(), Some("macbook"));
+    }
+
+    #[test]
+    fn malformed_responses_are_errors_not_empty_lists() {
+        // uma sessão "sem blocos" pareceria ociosa para quem fecha sessões
+        assert!(matches!(parse_view(&json!({})), Err(MuxError::Other(_))));
+        assert!(matches!(
+            parse_view(&json!({"windows": [{"label": "w"}]})),
+            Err(MuxError::Other(_))
+        ));
+        assert!(matches!(
+            parse_view(&json!({"windows": [{"layers": [{"blocks": [{"label": "x"}]}]}]})),
+            Err(MuxError::Other(_))
+        ));
+        assert_eq!(parse_view(&json!({"windows": []})).unwrap(), vec![]);
+        assert!(matches!(
+            parse_apps(&json!({"ok": true})),
+            Err(MuxError::Other(_))
+        ));
+        assert!(matches!(
+            parse_apps(&json!({"clients": [{"info": {"kind": "app"}}]})),
+            Err(MuxError::Other(_))
+        ));
+        assert!(matches!(
+            parse_sessions(&json!({})),
+            Err(MuxError::Other(_))
+        ));
+        assert!(matches!(
+            parse_sessions(&json!({"sessions": [{"label": "x"}]})),
+            Err(MuxError::Other(_))
+        ));
+        assert_eq!(
+            parse_sessions(&json_fx("session_list.json")).unwrap().len(),
+            1
+        );
     }
 
     #[test]
