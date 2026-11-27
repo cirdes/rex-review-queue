@@ -407,8 +407,8 @@ fn row_of(r: &PrRecord, section: Section, stack: String, state: &State, cfg: &Vi
             format!("{} · {paused}GitHub not synced{since}", phase_label(&r.phase))
         }
         (_, Section::Leaving) if r.phase == Phase::Removing && r.leaving_blocked_by_session => {
-            let held = r.blocked_since.map(|t| format!(" for {}", crate::today::ago(now - t))).unwrap_or_default();
-            format!("removing · session in use{held}")
+            let held = r.blocked_since.map(|t| format!(" {}", crate::today::ago(now - t))).unwrap_or_default();
+            format!("removing · session busy{held}")
         }
         (_, Section::Leaving) if r.phase == Phase::Removing => "removing".into(),
         (_, Section::Leaving) => {
@@ -1061,7 +1061,7 @@ mod tests {
         plain.remote = Remote::NotPending;
         let v = build(Some(&state_with(vec![r, plain], now)), &UiState::default(), &cfg(), now);
         assert_eq!(v.row(&rid(4)).unwrap().section, Section::Leaving);
-        assert_eq!(v.row(&rid(4)).unwrap().status, "removing · session in use for 25min");
+        assert_eq!(v.row(&rid(4)).unwrap().status, "removing · session busy 25min");
         assert_eq!(v.row(&rid(5)).unwrap().status, "removing");
     }
 
