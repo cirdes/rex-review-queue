@@ -1,0 +1,27 @@
+src/tui/run.rs
+  s_e016b879fcef07::t_502fa3c65d8cf7 496,768-769
+  s_e016b879fcef07::t_851bf457a63463 471-487,721
+  s_e016b879fcef07::t_558ed789f866c7 1078-1084
+  s_e016b879fcef07::t_9137f9fe35ee6c 770
+src/tui/model.rs
+  s_e016b879fcef07::t_851bf457a63463 1051-1061,1066-1075
+  s_e016b879fcef07::t_502fa3c65d8cf7 409-412,446-455
+  s_e016b879fcef07::t_9709a0e766dc2d 1062-1065
+  s_e016b879fcef07::t_eda4e66b397121 456-457
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1fc97f06d49a64646004cfd3b5ff334d35a06fb4",
+  "prompts": {},
+  "sessions": {
+    "s_e016b879fcef07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f7179532-7a96-4e96-97fe-61be0808ff9a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Cirdes <cirdes@linkana.com>"
+    }
+  }
+}
