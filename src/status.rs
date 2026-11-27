@@ -73,8 +73,8 @@ pub fn render_at(state: &State, now: DateTime<Utc>, remove_grace: Duration, repo
             (None, _) => String::new(),
         };
         let busy = match (r.phase == Phase::Removing && r.leaving_blocked_by_session, r.blocked_since) {
-            (true, Some(t)) => format!(" · session in use for {}", crate::today::ago(now - t)),
-            (true, None) => " · session in use".to_string(),
+            (true, Some(t)) => format!(" · session busy {}", crate::today::ago(now - t)),
+            (true, None) => " · session busy".to_string(),
             _ => String::new(),
         };
         out.push_str(&format!("{}  {}  {}  {}{busy}{leaving}{ci}{started}{stack}{owner}{warn}\n", r.key, r.author, r.title, phase_label(&r.phase)));
@@ -117,7 +117,7 @@ mod tests {
         r.blocked_since = Some(now - Duration::minutes(25));
         s.insert(r);
         let out = render_at(&s, now, Duration::minutes(15), &[], 60);
-        assert!(out.contains("o/r#3  ana  PR 3  removing · session in use for 25min"), "{out}");
+        assert!(out.contains("o/r#3  ana  PR 3  removing · session busy 25min"), "{out}");
     }
 
     #[test]
