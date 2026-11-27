@@ -1,0 +1,48 @@
+src/worktrees.rs
+  s_0017d405dfa96e::t_b94c5380631533 1-88
+  s_0017d405dfa96e::t_2ebb92bf927511 89-138
+.gitignore
+  s_0017d405dfa96e::t_6c7a625d90efc3 2-7
+Cargo.lock
+  s_0017d405dfa96e::t_4817dccc281c84 664-685
+Cargo.toml
+  s_0017d405dfa96e::t_8893061dd5b879 2-3
+config.example.toml
+  s_0017d405dfa96e::t_2c7b83404c0cdc 17-23
+docs/designs/rex-review-queue.md
+  s_0017d405dfa96e::t_2ae6f2846ae1bb 1-660
+docs/designs/spike_results.md
+  s_0017d405dfa96e::t_1da3bc59dc39bb 1-83
+src/config.rs
+  s_0017d405dfa96e::t_360759b09eb708 124
+src/daemon.rs
+  s_0017d405dfa96e::t_41834cef7342c3 346-347,868-869
+src/executor.rs
+  s_0017d405dfa96e::t_0f469e68c58460 4,8,17,59,309,351,358,387,406,430,449,464,479,491,510,530,544,560,576,604,619,637,655,674,691,735,745,759,784,803,819,837,854,876,892,910
+src/lib.rs
+  s_0017d405dfa96e::t_1ed1fd4354c956 24
+src/main.rs
+  s_0017d405dfa96e::t_dd6b9fb4473386 3-9,13,108,116
+src/paths.rs
+  s_0017d405dfa96e::t_9f4890d65e165d 14-15,37-40,51
+src/service.rs
+  s_0017d405dfa96e::t_424b8b88639d3f 8,114,171-172,190
+src/tui/run.rs
+  s_0017d405dfa96e::t_b59ef1e24a5d4f 515
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "78dd5665752008b7c41362ce731aded1ea1f38a4",
+  "prompts": {},
+  "sessions": {
+    "s_0017d405dfa96e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "640b68cb-1d34-4715-8e32-3697eee3e2d9",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Cirdes <cirdes@linkana.com>"
+    }
+  }
+}
