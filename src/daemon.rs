@@ -74,7 +74,11 @@ pub struct Daemon<'a> {
     last_extras: Option<Instant>,
     /// Sync pedido: coleta os extras no próximo tick, fora da cadência.
     pub(crate) extras_requested: bool,
+    last_update_check: Option<Instant>,
 }
+
+/// Cadência da comparação com a build mais nova da `main`.
+const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
 
 /// Prazo total da coleta de extras (CI, pilhas, meus PRs e "Início") num tick.
 const EXTRAS_BUDGET: Duration = Duration::from_secs(30);
@@ -133,6 +137,7 @@ impl<'a> Daemon<'a> {
             counter_requested: false,
             last_extras: None,
             extras_requested: false,
+            last_update_check: None,
         };
         d.recover_orphan_setup();
         if let Err(e) = d.save() {
@@ -449,6 +454,28 @@ impl<'a> Daemon<'a> {
         self.extras_requested = false;
         self.last_extras = Some(Instant::now());
         self.collect_extras_with(Utc::now(), &stopping);
+        if !stopping() && self.last_update_check.is_none_or(|t| t.elapsed() >= UPDATE_CHECK_EVERY) {
+            self.last_update_check = Some(Instant::now());
+            self.check_update(crate::update::local_sha());
+        }
+    }
+
+    /// Compara com a build mais nova da `main` e grava `update_available` (o painel mostra no
+    /// rodapé). Nunca instala. Falha (rede, gh) mantém o valor anterior.
+    pub(crate) fn check_update(&mut self, local: &str) {
+        match crate::update::check_against(self.runner, local) {
+            Ok(found) if found != self.state.update_available => {
+                if let Some(sha) = &found {
+                    info(&format!("new rrq build available: {}", crate::update::short(sha)));
+                }
+                self.state.update_available = found;
+                if let Err(e) = self.save() {
+                    info(&format!("{e:#}"));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => info(&format!("update check: {e:#}")),
+        }
     }
 
     /// CI, PRs abertos (pilhas), meus PRs e, com o que sobrar do orçamento, o "Início" (agentes
@@ -1952,5 +1979,26 @@ mod tests {
         d.collect_extras_with(extras_now(), &no_stop);
         assert_eq!(d.state.get(&PrKey::new("o/r", 7)).unwrap().work_started_at, None);
         assert!(rex.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn update_check_records_and_clears_the_new_build() {
+        let fx = fixture("feat/x");
+        let paths = Paths::from_home(fx.root.join("home"));
+        let runner = Routing { gh: FakeRunner::new() };
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
+        let newer = "abcdef1234567890abcdef1234567890abcdef12";
+        runner.gh.on("--pattern version.txt", Output::ok(&format!("{newer}\n")));
+        d.check_update("1111111");
+        assert_eq!(d.state.update_available.as_deref(), Some(newer));
+        assert_eq!(State::read(&paths.state_file()).unwrap().update_available.as_deref(), Some(newer));
+        runner.gh.on("--pattern version.txt", Output::fail(1, "HTTP 502"));
+        d.check_update("1111111");
+        assert_eq!(d.state.update_available.as_deref(), Some(newer), "falha mantém o valor");
+        runner.gh.on("--pattern version.txt", Output::ok(&format!("{newer}\n")));
+        d.check_update(newer);
+        assert_eq!(d.state.update_available, None, "já na build nova");
+        assert!(runner.gh.lines().iter().all(|l| !l.contains("tar.gz")), "o daemon nunca baixa a build");
     }
 }

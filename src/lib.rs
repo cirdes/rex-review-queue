@@ -26,6 +26,7 @@ pub mod state;
 pub mod status;
 pub mod today;
 pub mod tui;
+pub mod update;
 pub mod worktrees;
 #[cfg(test)]
 pub mod testutil;
