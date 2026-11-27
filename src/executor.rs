@@ -156,11 +156,9 @@ pub(crate) fn would_overwrite(err: &str) -> bool {
     ["would be overwritten", "not uptodate", "Entry '"].iter().any(|n| err.contains(n))
 }
 
-fn discard_worktree(ctx: &Ctx, repo: &Path, path: &Path, workspace: Option<String>) -> Result<()> {
-    match workspace {
-        Some(id) => ctx.herdr.remove_worktree(&id),
-        None => ctx.git().worktree_remove(repo, path),
-    }
+/// Remove a worktree com git (sem `--force`) e faz o prune. Não passa mais pelo Herdr.
+fn discard_worktree(ctx: &Ctx, repo: &Path, path: &Path) -> Result<()> {
+    ctx.worktrees.remove(repo, path)
 }
 
 /// Apaga a branch do PR só se o daemon a criou, se ela ainda está no sha que ele
@@ -191,8 +189,6 @@ pub fn remove(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<Option<String
     if rec.ownership != Ownership::Managed {
         return Ok(None);
     }
-    // IPC antes da última checagem, para a janela entre checar e remover ser mínima.
-    let workspace = if rec.path.exists() { ctx.herdr.find_open_workspace(&repo.path, &rec.path)? } else { None };
     let f = facts::collect(ctx.runner, &rec.path, &repo.disposable_ignored)?;
     if let Some(Divergence::Diverged(reason)) = divergence(&rec, &f) {
         let r = record(state, key)?;
@@ -204,9 +200,8 @@ pub fn remove(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<Option<String
         if let Some(head) = &f.head {
             git.backup(&repo.path, key.number, head, ctx.now)?;
         }
-        discard_worktree(ctx, &repo.path, &rec.path, workspace)?;
     }
-    git.worktree_prune(&repo.path)?;
+    discard_worktree(ctx, &repo.path, &rec.path)?;
     let note = delete_owned_branch(&git, &repo.path, &rec)?;
     state.remove(key);
     if let Some(n) = &note {
@@ -226,7 +221,6 @@ pub fn release(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<String> {
     if rec.ownership == Ownership::Managed {
         bail!("{key} is not adopted; it is removed automatically when it leaves your queue");
     }
-    let workspace = if rec.path.exists() { ctx.herdr.find_open_workspace(&repo.path, &rec.path)? } else { None };
     git.fetch_origin(&repo.path).context("could not update origin to confirm that nothing is lost")?;
     // Depois de squash merge a branch some do origin; o head do PR continua em refs/pull/<n>/head.
     if let Err(e) = git.fetch_pull_head(&repo.path, key.number) {
@@ -270,9 +264,8 @@ pub fn release(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<String> {
         if let Some(head) = &f.head {
             git.backup(&repo.path, key.number, head, ctx.now)?;
         }
-        discard_worktree(ctx, &repo.path, &rec.path, workspace)?;
     }
-    git.worktree_prune(&repo.path)?;
+    discard_worktree(ctx, &repo.path, &rec.path)?;
     let note = delete_owned_branch(&git, &repo.path, &rec)?;
     if matches!(rec.remote, Remote::Pending | Remote::Unknown) {
         state.suppressions.insert(key.to_string(), Suppression { after: rec.last_request_event_at });

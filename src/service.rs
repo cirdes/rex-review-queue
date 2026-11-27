@@ -6,6 +6,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 pub const LABEL: &str = "com.cirdes.rrq";
+/// LaunchAgent do herdr-reviewq. Os dois daemons nunca podem rodar sobre o mesmo `worktrees_dir`.
+pub const OLD_AGENT_LABEL: &str = "dev.cirdes.herdr-reviewq";
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
@@ -94,12 +96,33 @@ pub fn retry_once<T>(mut f: impl FnMut() -> Result<T>, delay: Duration) -> Resul
 }
 
 fn service_target() -> String {
-    format!("{}/{LABEL}", domain())
+    target_of(LABEL)
+}
+
+fn target_of(label: &str) -> String {
+    format!("{}/{label}", domain())
 }
 
 fn is_loaded() -> bool {
+    is_label_loaded(LABEL)
+}
+
+/// O LaunchAgent do herdr-reviewq está carregado nesta sessão de login?
+pub fn old_agent_loaded() -> bool {
+    is_label_loaded(OLD_AGENT_LABEL)
+}
+
+/// Recusa seguir enquanto o daemon antigo estiver carregado.
+fn refuse_if_old_agent(loaded: bool) -> Result<()> {
+    if loaded {
+        bail!("the herdr-reviewq daemon ({OLD_AGENT_LABEL}) is still loaded; run `herdr-reviewq service uninstall` first, so both daemons never manage the same worktrees");
+    }
+    Ok(())
+}
+
+fn is_label_loaded(label: &str) -> bool {
     Command::new("launchctl")
-        .args(["print", &service_target()])
+        .args(["print", &target_of(label)])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -108,6 +131,7 @@ fn is_loaded() -> bool {
 }
 
 pub fn install(paths: &Paths) -> Result<()> {
+    refuse_if_old_agent(old_agent_loaded())?;
     if !paths.config_file.exists() {
         bail!("create {} first (see config.example.toml)", paths.config_file.display());
     }
@@ -165,6 +189,14 @@ pub fn restart() -> Result<()> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn refuses_while_the_old_daemon_is_loaded() {
+        let err = refuse_if_old_agent(true).unwrap_err().to_string();
+        assert!(err.contains(OLD_AGENT_LABEL) && err.contains("herdr-reviewq service uninstall"), "{err}");
+        assert!(refuse_if_old_agent(false).is_ok());
+        assert!(target_of(OLD_AGENT_LABEL).ends_with("/dev.cirdes.herdr-reviewq"));
+    }
 
     #[test]
     fn plist_is_valid_and_has_stable_paths() {
