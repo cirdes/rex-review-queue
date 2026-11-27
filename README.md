@@ -183,7 +183,7 @@ A lista tem estas seções, nesta ordem: **Started** (reviews pendentes em que u
 | `↑` `↓` / `k` `j` | Move a seleção. |
 | `/` | Busca (ver [Busca](#busca)). |
 | `enter` | Troca o app do MacBook para a sessão do PR. Na primeira vez, cria a sessão `#123 repo` (ou `owner/repo#123` com repos de mais de um dono) com um shell na worktree. Se a sessão foi fechada à mão, cria de novo. Funciona em qualquer fase com worktree, menos enquanto ela é criada ou removida. Num PR seu (**My PRs**), vai para a worktree onde a branch do PR está, ou cria uma em `worktrees_dir/<owner>/<repo>/mine-pr-<n>`. |
-| `c` | Faz o mesmo que o Enter e abre o combo: o `claude` à direita do shell e o reviewr à direita do `claude`, com 55% da largura dos dois. Bloco que já existe com o programa rodando fica como está; bloco cujo programa saiu ganha o comando de novo. Repetir o `c` nunca duplica blocos, e um `c` que falhou no meio é completado pelo seguinte. O foco termina no `claude`. |
+| `c` | Faz o mesmo que o Enter e abre o combo: o `claude` roda no próprio shell da sessão e o reviewr abre à direita dele, com 55% da largura. Sessão antiga que já tem um bloco `claude` separado continua usando esse bloco. Bloco que já existe com o programa rodando fica como está; bloco cujo programa saiu ganha o comando de novo. Repetir o `c` nunca duplica blocos, e um `c` que falhou no meio é completado pelo seguinte. O foco termina no `claude`. |
 | `f` | Vai para a review pronta mais antiga, como o Enter. |
 | `o` | Copia a URL do PR para o clipboard do MacBook (OSC 52). |
 | `l` | Abre o log de setup do PR num bloco à direita do painel, com `less +F`. |
