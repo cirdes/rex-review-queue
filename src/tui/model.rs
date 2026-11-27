@@ -406,6 +406,10 @@ fn row_of(r: &PrRecord, section: Section, stack: String, state: &State, cfg: &Vi
             let paused = if r.not_pending_since.is_some() { "grace paused: no sync · " } else { "" };
             format!("{} · {paused}GitHub not synced{since}", phase_label(&r.phase))
         }
+        (_, Section::Leaving) if r.phase == Phase::Removing && r.leaving_blocked_by_session => {
+            let held = r.blocked_since.map(|t| format!(" for {}", crate::today::ago(now - t))).unwrap_or_default();
+            format!("removing · session in use{held}")
+        }
         (_, Section::Leaving) if r.phase == Phase::Removing => "removing".into(),
         (_, Section::Leaving) => {
             let left = r.not_pending_since.map(|t| cfg.remove_grace - (now - t)).unwrap_or_else(chrono::Duration::zero);
@@ -437,6 +441,18 @@ fn row_of(r: &PrRecord, section: Section, stack: String, state: &State, cfg: &Vi
             log: true,
         },
     }
+}
+
+/// Avisos de build nova no rodapé: a da `main` que o daemon viu e a já instalada em disco
+/// enquanto este painel roda o binário antigo.
+pub fn update_notes(state: &State, exe_replaced: bool) -> Vec<String> {
+    let mut out = vec![];
+    if exe_replaced {
+        out.push("rrq was updated on disk; quit and run `rrq tui` again to use it".into());
+    } else if let Some(sha) = &state.update_available {
+        out.push(format!("new rrq build {}: run `rrq update`", crate::update::short(sha)));
+    }
+    out
 }
 
 fn today_detail(state: &State, valid_as_of: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
@@ -1031,5 +1047,30 @@ mod tests {
         let s = search_state(now);
         let v = build(Some(&s), &UiState { filter: "#101".into(), ..Default::default() }, &cfg(), now);
         assert_eq!(v.pending, "2");
+    }
+
+    #[test]
+    fn removal_waiting_for_the_session_shows_how_long() {
+        let now = Utc::now();
+        let mut r = rec(4, Phase::Removing);
+        r.remote = Remote::NotPending;
+        r.not_pending_since = Some(now - chrono::Duration::minutes(40));
+        r.leaving_blocked_by_session = true;
+        r.blocked_since = Some(now - chrono::Duration::minutes(25));
+        let mut plain = rec(5, Phase::Removing);
+        plain.remote = Remote::NotPending;
+        let v = build(Some(&state_with(vec![r, plain], now)), &UiState::default(), &cfg(), now);
+        assert_eq!(v.row(&rid(4)).unwrap().section, Section::Leaving);
+        assert_eq!(v.row(&rid(4)).unwrap().status, "removing · session in use for 25min");
+        assert_eq!(v.row(&rid(5)).unwrap().status, "removing");
+    }
+
+    #[test]
+    fn update_notes_prefer_the_binary_already_replaced() {
+        let mut s = State::default();
+        assert!(update_notes(&s, false).is_empty());
+        s.update_available = Some("abcdef1234567890".into());
+        assert_eq!(update_notes(&s, false), vec!["new rrq build abcdef1: run `rrq update`".to_string()]);
+        assert!(update_notes(&s, true)[0].contains("quit and run `rrq tui` again"));
     }
 }

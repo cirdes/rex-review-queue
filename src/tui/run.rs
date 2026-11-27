@@ -468,6 +468,23 @@ struct Emitter {
     records: BTreeMap<String, Record>,
 }
 
+/// O binário deste painel foi trocado em disco (por `rrq update`) depois que ele abriu.
+struct ExeWatch {
+    path: Option<std::path::PathBuf>,
+    started: std::time::SystemTime,
+}
+
+impl ExeWatch {
+    fn start() -> Self {
+        Self { path: std::env::current_exe().ok(), started: std::time::SystemTime::now() }
+    }
+
+    fn replaced(&self) -> bool {
+        let modified = self.path.as_ref().and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        modified.is_some_and(|m| m > self.started)
+    }
+}
+
 impl Emitter {
     /// Na partida, apaga tudo o que um painel anterior deixou neste bloco e começa do zero.
     fn start() -> (Self, String) {
@@ -476,7 +493,7 @@ impl Emitter {
 
     /// O que escrever para o terminal passar a refletir `state` e `sessions`.
     fn step(&mut self, state: &State, sessions: &Sessions) -> Vec<String> {
-        let root = pst::root_for(&pst::active_conditions(state, false));
+        let root = pst::root_for(&pst::active_conditions(state, state.sessions_corrupt_since.is_some()));
         let records = pst::records_for(state, sessions);
         let mut out = vec![];
         if self.root.as_ref() != Some(&root) {
@@ -701,6 +718,7 @@ fn run_loop(paths: &Paths, cfg: Config) -> Result<Exit> {
     let (work, results) = spawn_worker(cfg, paths.clone());
     let mut ui = UiState::default();
     let mut watch = StateWatch::default();
+    let exe = ExeWatch::start();
     let mut sessions_watch = SessionsWatch::default();
     let mut emitter = EMITTING.load(Ordering::SeqCst).then(|| {
         let (e, first) = Emitter::start();
@@ -746,6 +764,9 @@ fn run_loop(paths: &Paths, cfg: Config) -> Result<Exit> {
         }
         if emitter.is_none() {
             view.notes.push("another `rrq tui` sends the Rex alerts; this panel only shows the queue".into());
+        }
+        if let Some(state) = watch.state.as_ref() {
+            view.notes.extend(crate::tui::model::update_notes(state, exe.replaced()));
         }
         let old_order = std::mem::replace(&mut ui.order, view.order());
         ui.selected = reselect(&old_order, ui.selected.as_ref(), &view);
@@ -1054,6 +1075,13 @@ mod tests {
         let seqs = em.step(&broken, &sessions);
         assert_eq!(seqs.len(), 1);
         assert!(seqs[0].contains("state=error"));
+
+        // sessions.json isolado pelo daemon: também é condição ativa da raiz
+        let (mut em, _) = Emitter::start();
+        let mut corrupt = state.clone();
+        corrupt.sessions_corrupt_since = Some(chrono::Utc::now());
+        let seqs = em.step(&corrupt, &sessions);
+        assert!(seqs[0].contains("state=error"), "{seqs:?}");
     }
 
     #[test]
