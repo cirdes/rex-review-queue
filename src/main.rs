@@ -1,13 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use rrq::config::{grace_duration, Config, DEFAULT_REMOVE_GRACE_SECS};
-use rrq::herdr::{self, Herdr, HerdrCli, UiRouting};
 use rrq::paths::Paths;
 use rrq::requests::{self, RequestKind};
-use rrq::runner::RealRunner;
 use rrq::state::State;
-use rrq::{daemon, service, status, ui};
-use std::time::Instant;
+use rrq::{daemon, service, status};
 
 #[derive(Parser)]
 #[command(name = "rrq", version, about = "Ready-to-use worktrees for the reviews requested from you, in Rex")]
@@ -34,32 +31,8 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Interactive panel (herdr plugin pane)
+    /// Interactive panel, in the current Rex block
     Tui,
-    /// The panel workspace in herdr
-    Ui {
-        #[command(subcommand)]
-        action: UiAction,
-    },
-    /// Focuses a PR in herdr
-    Focus {
-        #[command(subcommand)]
-        target: FocusTarget,
-    },
-}
-
-#[derive(Subcommand)]
-enum UiAction {
-    /// Ensures the reviewq workspace with the TUI (without focus)
-    Ensure,
-    /// Ensures and focuses the reviewq workspace
-    Open,
-}
-
-#[derive(Subcommand)]
-enum FocusTarget {
-    /// The PR that has been ready the longest
-    FirstReady,
 }
 
 fn load_cfg(p: &Paths) -> Result<Config> {
@@ -114,46 +87,5 @@ fn main() -> Result<()> {
             ServiceAction::Restart => service::restart(),
         },
         Command::Tui => rrq::tui::run::run_logged(paths.clone(), || load_cfg(&paths)),
-        Command::Ui { action } => {
-            let runner = RealRunner;
-            let mut cfg = load_cfg(&paths);
-            let routing = UiRouting::from_process_env(cfg.as_ref().ok().and_then(|c| c.herdr_session.clone()));
-            if let Ok(c) = cfg.as_mut() {
-                herdr::resolve_backend(c, &runner, &routing, &paths.home, true);
-            }
-            let client: Box<dyn Herdr> = match cfg.as_ref() {
-                Ok(c) => herdr::client(c, &runner, &routing, &paths.home, ui::UI_CALL_TIMEOUT),
-                Err(_) => Box::new(HerdrCli::routed(&runner, &routing).with_timeout(ui::UI_CALL_TIMEOUT)),
-            };
-            let herdr = client.as_ref();
-            let deadline = Instant::now() + ui::ENSURE_TOTAL;
-            let r = cfg.and_then(|_| match action {
-                UiAction::Ensure => ui::ensure(herdr, &paths.ui_lock_file(), &paths.home, deadline, ui::LOCK_WAIT_CLI).map(|_| ()),
-                UiAction::Open => ui::open(herdr, &paths.ui_lock_file(), &paths.home, deadline, ui::LOCK_WAIT_CLI),
-            });
-            // `ui open` é a action do atalho: o stderr não aparece para ninguém
-            match action {
-                UiAction::Open => ui::notify_error(herdr, r),
-                UiAction::Ensure => r,
-            }
-        }
-        Command::Focus { target: FocusTarget::FirstReady } => {
-            let runner = RealRunner;
-            let mut cfg = load_cfg(&paths);
-            let routing = UiRouting::from_process_env(cfg.as_ref().ok().and_then(|c| c.herdr_session.clone()));
-            if let Ok(c) = cfg.as_mut() {
-                herdr::resolve_backend(c, &runner, &routing, &paths.home, true);
-            }
-            let client: Box<dyn Herdr> = match cfg.as_ref() {
-                Ok(c) => herdr::client(c, &runner, &routing, &paths.home, ui::UI_CALL_TIMEOUT),
-                Err(_) => Box::new(HerdrCli::routed(&runner, &routing).with_timeout(ui::UI_CALL_TIMEOUT)),
-            };
-            let herdr = client.as_ref();
-            let r = cfg.and_then(|cfg| match ui::focus_first_ready(herdr, &cfg, || State::read(&paths.state_file()))? {
-                Some(_) => Ok(()),
-                None => herdr.notify("reviewq", "no PR ready", "none"),
-            });
-            ui::notify_error(herdr, r)
-        }
     }
 }

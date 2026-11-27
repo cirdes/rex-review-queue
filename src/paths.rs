@@ -33,7 +33,6 @@ impl Paths {
         self.setup_logs_dir().join(format!("{}-pr-{}.log", key.repo.replace('/', "-"), key.number))
     }
     pub fn requests_dir(&self) -> PathBuf { self.state_dir.join("requests") }
-    pub fn ui_lock_file(&self) -> PathBuf { self.state_dir.join("ui.lock") }
     /// Mapa PR → sessão do Rex (`rrq` cria as sessões sob demanda).
     pub fn sessions_file(&self) -> PathBuf { self.state_dir.join("sessions.json") }
     /// Arquivos de flock (por PR, `sessions.json`, emissor do painel). Nunca são apagados.
