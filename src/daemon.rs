@@ -89,9 +89,7 @@ pub const MIN_REX_REVISION: u32 = 24;
 /// Conferência da partida. `Ok(true)`: Rex verificado; `Ok(false)`: Rex fora do ar, o daemon
 /// sobe e trata o Rex como ausente. Erro: o daemon não pode rodar.
 pub fn check_start(mux: &dyn Mux, old_agent_loaded: bool) -> Result<bool> {
-    if old_agent_loaded {
-        bail!("the herdr-reviewq daemon (dev.cirdes.herdr-reviewq) is still loaded; run `herdr-reviewq service uninstall` first, so both daemons never manage the same worktrees");
-    }
+    crate::service::refuse_if_old_agent(old_agent_loaded)?;
     rex_revision_ok(mux)
 }
 

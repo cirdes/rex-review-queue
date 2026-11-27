@@ -160,7 +160,7 @@ pub(crate) fn would_overwrite(err: &str) -> bool {
     ["would be overwritten", "not uptodate", "Entry '"].iter().any(|n| err.contains(n))
 }
 
-/// Remove a worktree com git (sem `--force`) e faz o prune. Não passa mais pelo Herdr.
+/// Remove a worktree com git (sem `--force`) e faz o prune.
 fn discard_worktree(ctx: &Ctx, repo: &Path, path: &Path) -> Result<()> {
     ctx.worktrees.remove(repo, path)
 }

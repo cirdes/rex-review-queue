@@ -113,7 +113,7 @@ pub fn old_agent_loaded() -> bool {
 }
 
 /// Recusa seguir enquanto o daemon antigo estiver carregado.
-fn refuse_if_old_agent(loaded: bool) -> Result<()> {
+pub fn refuse_if_old_agent(loaded: bool) -> Result<()> {
     if loaded {
         bail!("the herdr-reviewq daemon ({OLD_AGENT_LABEL}) is still loaded; run `herdr-reviewq service uninstall` first, so both daemons never manage the same worktrees");
     }
