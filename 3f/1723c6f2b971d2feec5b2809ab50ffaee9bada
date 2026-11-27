@@ -1,0 +1,35 @@
+src/update.rs
+  s_5646e20598039d::t_1b9019ba016945 161
+src/status.rs
+  s_5646e20598039d::t_ccc3fd566bfa8b 75-80,109-121
+  s_5646e20598039d::t_e1d8e303d6530b 122
+src/main.rs
+  s_5646e20598039d::t_be2d18720c48e9 18-24,34-44,65-67,69
+  s_5646e20598039d::t_0f6f850b5fbbdb 70-72,75-79,82-91,117-121,131-137
+src/service.rs
+  s_5646e20598039d::t_1b9019ba016945 2,111-113,118,129-133,137-146,218-235
+  s_5646e20598039d::t_ecc3bbd84ab459 195-197
+  s_5646e20598039d::t_ccc3fd566bfa8b 17-22,25
+  s_5646e20598039d::t_3a5259df6bc0f1 236
+src/config.rs
+  s_5646e20598039d::t_1b9019ba016945 141,207
+  s_5646e20598039d::t_5f59e2bbaf7d9c 98-116,118,276-277,279-284
+  s_5646e20598039d::t_febb19744e2fa2 278
+  s_5646e20598039d::t_7606a289605fbc 285
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3f1723c6f2b971d2feec5b2809ab50ffaee9bada",
+  "prompts": {},
+  "sessions": {
+    "s_5646e20598039d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "14e3aea6-0f9d-42c4-b672-15c4baacdb8d",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Cirdes <cirdes@linkana.com>"
+    }
+  }
+}
