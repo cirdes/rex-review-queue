@@ -1,0 +1,21 @@
+src/executor.rs
+  s_0017d405dfa96e::t_7ca6a12bc07345 159-161,204,268
+src/service.rs
+  s_0017d405dfa96e::t_da201ff20155ee 9-10,99-103,107-123,125,134,193-200
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "72faa029c3e6fbe5fd2dcb1d88b076077bf23886",
+  "prompts": {},
+  "sessions": {
+    "s_0017d405dfa96e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "640b68cb-1d34-4715-8e32-3697eee3e2d9",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Cirdes <cirdes@linkana.com>"
+    }
+  }
+}
