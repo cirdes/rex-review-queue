@@ -1,6 +1,6 @@
 /target
 
-# Artefatos de trabalho do design (EGM). O design final e os spikes ficam em docs/designs/.
+# Artefatos de trabalho do design (EGM), incluindo o design e os spikes em /docs/. Ficam só na máquina do autor.
 /concept_input.md
 /concepts_brief.md
 /design_draft.md
