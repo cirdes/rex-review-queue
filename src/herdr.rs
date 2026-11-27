@@ -1,4 +1,7 @@
-use crate::config::{Backend, Config};
+// Legado do herdr-reviewq, sem uso desde a fase 5: sai inteiro na fase 6 (com o plugin e a
+// bridge). Até lá, o allow evita que o clippy reclame do que ficou sem chamador.
+#![allow(dead_code)]
+
 use crate::runner::{Cmd, Output, Runner};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -350,26 +353,6 @@ impl Herdr for HerdrCli<'_> {
     }
 }
 
-/// Cliente herdr do backend da config: o do terminal, roteado como antes, ou o app desktop.
-pub fn client<'a>(
-    cfg: &crate::config::Config,
-    runner: &'a dyn Runner,
-    routing: &UiRouting,
-    home: &Path,
-    timeout: Duration,
-) -> Box<dyn Herdr + 'a> {
-    match cfg.backend {
-        // `auto` não resolvido (nenhum sinal): o herdr do terminal, o padrão de antes
-        crate::config::Backend::Herdr | crate::config::Backend::Auto => Box::new(HerdrCli::routed(runner, routing).with_timeout(timeout)),
-        crate::config::Backend::HerdrApp => Box::new(
-            HerdrApp::new(runner, home.join(".local/bin").join(TUI_BIN))
-                .hc_bin(hc_program(home, on_path(HC_BIN)))
-                .with_timeout(timeout)
-                .remote(window_is_remote(cfg.window, on_path(APP_BIN))),
-        ),
-    }
-}
-
 /// Label que marca os terminais de um worktree do reviewq no herdr-core.
 const WORKTREE_LABEL: &str = "reviewq.worktree";
 /// Quanto esperar a janela do herdr-app adotar um space recém-criado.
@@ -389,70 +372,6 @@ const BRIDGE_FRESH_MS: i64 = 120_000;
 const APP_BIN: &str = "herdr-app";
 const HC_BIN: &str = "hc";
 const BRIDGE_HELP: &str = "install the reviewq-bridge mod in the window (README, \"Window on another machine\")";
-
-/// `auto`: sem `herdr-app` aqui, a janela só pode estar em outra máquina.
-pub fn window_is_remote(window: crate::config::Window, app_here: bool) -> bool {
-    match window {
-        crate::config::Window::Auto => !app_here,
-        crate::config::Window::Local => false,
-        crate::config::Window::Remote => true,
-    }
-}
-
-/// O que dá para observar sobre qual Herdr está em uso. Os dois podem rodar ao mesmo tempo na
-/// mesma máquina, então "está de pé" sozinho não decide: o ambiente do painel e o sinal da
-/// janela remota pesam mais.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BackendSignals {
-    /// Este processo roda num pane do herdr do terminal (`HERDR_ENV=1`).
-    pub in_herdr_pane: bool,
-    /// Este processo roda num terminal do herdr-core (`HC_TERMINAL_ID`).
-    pub in_app_terminal: bool,
-    /// O mod `reviewq-bridge` de uma janela remota deu sinal há pouco.
-    pub bridge_fresh: bool,
-    /// O servidor do herdr do terminal responde.
-    pub herdr_up: bool,
-    /// O `herdr-app` está no PATH desta máquina.
-    pub app_here: bool,
-}
-
-/// Backend escolhido e o motivo, para o log. `None`: `auto` sem nenhum sinal.
-pub fn pick_backend(requested: Backend, s: &BackendSignals) -> Option<(Backend, &'static str)> {
-    Some(match requested {
-        Backend::Herdr | Backend::HerdrApp => (requested, "from the config"),
-        Backend::Auto if s.in_herdr_pane => (Backend::Herdr, "auto: panel in a herdr pane"),
-        Backend::Auto if s.in_app_terminal => (Backend::HerdrApp, "auto: panel in a herdr-app terminal"),
-        Backend::Auto if s.bridge_fresh => (Backend::HerdrApp, "auto: herdr-app window listening to this machine"),
-        Backend::Auto if s.herdr_up => (Backend::Herdr, "auto: terminal herdr running"),
-        Backend::Auto if s.app_here => (Backend::HerdrApp, "auto: herdr-app installed here"),
-        Backend::Auto => return None,
-    })
-}
-
-/// Troca `auto` pelo backend em uso e devolve o motivo; `None` se nada indica qual.
-/// `from_env`: o painel e as actions olham o próprio ambiente; o daemon (launchd) não tem um.
-/// Os testes de rede só rodam se o ambiente não decidiu.
-pub fn resolve_backend(cfg: &mut Config, runner: &dyn Runner, routing: &UiRouting, home: &Path, from_env: bool) -> Option<&'static str> {
-    let env_set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
-    let mut s = BackendSignals::default();
-    if cfg.backend == Backend::Auto {
-        if from_env {
-            s.in_herdr_pane = std::env::var("HERDR_ENV").is_ok_and(|v| v == "1");
-            s.in_app_terminal = env_set("HC_TERMINAL_ID");
-        }
-        if !s.in_herdr_pane && !s.in_app_terminal {
-            let probe = Duration::from_secs(5);
-            let app = HerdrApp::new(runner, PathBuf::new()).hc_bin(hc_program(home, on_path(HC_BIN))).with_timeout(probe);
-            s.bridge_fresh = app.bridge_age_ms(probe).ok().flatten().is_some_and(|age| age <= BRIDGE_FRESH_MS);
-            s.herdr_up = !s.bridge_fresh
-                && HerdrCli::routed(runner, routing).with_timeout(probe).list_workspaces(Instant::now() + probe).is_ok();
-            s.app_here = on_path(APP_BIN);
-        }
-    }
-    let (backend, why) = pick_backend(cfg.backend, &s)?;
-    cfg.backend = backend;
-    Some(why)
-}
 
 /// O `hc` pelo PATH quando ele está lá; senão o de `~/.local/bin`, onde o instalador o põe.
 /// Pelo `hc exec` o PATH é o mínimo do sistema e não tem o `hc`.
@@ -1243,56 +1162,6 @@ mod tests {
         assert!(!HerdrCli::new(&fake, None).list_panes("w5", far()).unwrap()[0].is_reviewq_tui);
     }
 
-    #[test]
-    fn pick_backend_prefers_config_then_environment_then_what_is_up() {
-        let none = BackendSignals::default();
-        let all = BackendSignals { in_herdr_pane: true, in_app_terminal: true, bridge_fresh: true, herdr_up: true, app_here: true };
-        assert_eq!(pick_backend(Backend::HerdrApp, &all).unwrap().0, Backend::HerdrApp);
-        assert_eq!(pick_backend(Backend::Herdr, &all).unwrap().0, Backend::Herdr);
-        assert_eq!(pick_backend(Backend::Auto, &all).unwrap().0, Backend::Herdr, "pane do herdr vence");
-        let pick = |s: BackendSignals| pick_backend(Backend::Auto, &s).map(|(b, _)| b);
-        assert_eq!(pick(BackendSignals { in_app_terminal: true, herdr_up: true, ..none }), Some(Backend::HerdrApp));
-        // os dois de pé na mesma máquina: a janela ouvindo decide
-        assert_eq!(pick(BackendSignals { bridge_fresh: true, herdr_up: true, ..none }), Some(Backend::HerdrApp));
-        assert_eq!(pick(BackendSignals { herdr_up: true, app_here: true, ..none }), Some(Backend::Herdr));
-        assert_eq!(pick(BackendSignals { app_here: true, ..none }), Some(Backend::HerdrApp));
-        assert_eq!(pick(none), None);
-    }
-
-    fn auto_cfg(backend: Backend) -> Config {
-        let mut c = Config::parse("worktrees_dir = \"/w\"\n[[repos]]\nname = \"a/b\"\npath = \"/r\"\nsetup = []\n", Path::new("/h")).unwrap();
-        c.backend = backend;
-        c
-    }
-
-    #[test]
-    fn resolve_backend_reads_the_bridge_before_asking_herdr() {
-        let routing = UiRouting { bin: "herdr".into(), session: None };
-        let fake = FakeRunner::new();
-        fake.on("reviewq-bridge", beat(5_000));
-        let mut cfg = auto_cfg(Backend::Auto);
-        assert!(resolve_backend(&mut cfg, &fake, &routing, Path::new("/h"), false).is_some());
-        assert_eq!(cfg.backend, Backend::HerdrApp);
-        assert!(!fake.lines().iter().any(|l| l.contains("workspace list")), "janela ouvindo já decide");
-
-        // janela sem sinal recente, herdr do terminal responde
-        let fake = FakeRunner::new();
-        fake.on("reviewq-bridge", beat(10 * 60_000));
-        fake.on("workspace list", Output::ok(r#"{"result":{"workspaces":[]}}"#));
-        let mut cfg = auto_cfg(Backend::Auto);
-        resolve_backend(&mut cfg, &fake, &routing, Path::new("/h"), false).unwrap();
-        assert_eq!(cfg.backend, Backend::Herdr);
-    }
-
-    #[test]
-    fn resolve_backend_keeps_an_explicit_config_without_probing() {
-        let routing = UiRouting { bin: "herdr".into(), session: None };
-        let fake = FakeRunner::new();
-        let mut cfg = auto_cfg(Backend::HerdrApp);
-        assert_eq!(resolve_backend(&mut cfg, &fake, &routing, Path::new("/h"), true), Some("from the config"));
-        assert_eq!(cfg.backend, Backend::HerdrApp);
-        assert!(fake.lines().is_empty());
-    }
 
     #[test]
     fn list_panes_rejects_incomplete_json() {
@@ -1420,20 +1289,6 @@ mod tests {
         serde_json::from_str(cmd.args.last().unwrap()).unwrap()
     }
 
-    #[test]
-    fn client_routes_a_remote_window_through_the_core() {
-        let fake = FakeRunner::new();
-        fake.on("doc.get", spaces_doc(4, &[("rq-1", "#7 título")]));
-        let cfg = crate::config::Config::parse(
-            "backend = \"herdr-app\"\nwindow = \"remote\"\nworktrees_dir = \"/w\"\n[[repos]]\nname = \"o/r\"\npath = \"/r\"\nsetup = []\n",
-            Path::new("/h"),
-        )
-        .unwrap();
-        let routing = UiRouting { bin: "herdr".into(), session: None };
-        let ws = client(&cfg, &fake, &routing, Path::new("/h"), Duration::from_secs(5)).list_workspaces(far()).unwrap();
-        assert_eq!(ws, vec![WorkspaceInfo { id: "rq-1".into(), label: "#7 título".into(), focused: false }]);
-        assert!(fake.lines().iter().all(|l| !l.contains("herdr-app ")), "{:?}", fake.lines());
-    }
 
     #[test]
     fn remote_lists_nothing_before_the_window_ever_opened() {
@@ -1492,14 +1347,6 @@ mod tests {
         assert!(fake.lines().is_empty());
     }
 
-    #[test]
-    fn auto_window_is_remote_only_without_the_app_here() {
-        use crate::config::Window;
-        assert!(window_is_remote(Window::Auto, false));
-        assert!(!window_is_remote(Window::Auto, true));
-        assert!(window_is_remote(Window::Remote, true));
-        assert!(!window_is_remote(Window::Local, false));
-    }
 
     #[test]
     fn hc_comes_from_the_path_or_from_local_bin_when_the_path_lacks_it() {
@@ -1554,19 +1401,6 @@ mod tests {
         assert_eq!(req["params"]["value"]["spaces"][0]["id"], "sp1");
     }
 
-    #[test]
-    fn client_follows_the_configured_backend() {
-        let fake = FakeRunner::new();
-        fake.on("herdr-app ls", Output::ok(&spaces(&[("sp1", "linkana", true)])));
-        let cfg = crate::config::Config::parse(
-            "backend = \"herdr-app\"\nwindow = \"local\"\nworktrees_dir = \"/w\"\n[[repos]]\nname = \"o/r\"\npath = \"/r\"\nsetup = []\n",
-            Path::new("/h"),
-        )
-        .unwrap();
-        let routing = UiRouting { bin: "herdr".into(), session: None };
-        let ws = client(&cfg, &fake, &routing, Path::new("/h"), Duration::from_secs(5)).list_workspaces(far()).unwrap();
-        assert_eq!(ws, vec![WorkspaceInfo { id: "sp1".into(), label: "linkana".into(), focused: true }]);
-    }
 
     #[test]
     fn app_creates_worktree_without_force_and_names_the_space_once_adopted() {
@@ -1662,39 +1496,7 @@ mod tests {
         assert!(calls[0].args[1].contains("sound name") && !calls[1].args[1].contains("sound name"));
     }
 
-    #[test]
-    fn app_ensure_opens_the_panel_space_with_the_tui_and_finds_it_running() {
-        let dir = tempfile::tempdir().unwrap();
-        let fake = FakeRunner::new();
-        fake.on("herdr-app ls", Output::ok(&spaces(&[("sp1", "linkana", true)])));
-        fake.on("hc run", Output::ok(r#"{"address":"t8"}"#));
-        fake.on("herdr-app ls", Output::fail(1, "{}"));
-        fake.on("hc ls", Output::ok(r#"{"terminals":[{"address":"t8","state":"live"}]}"#));
-        fake.on("hc get t8", Output::ok(r#"{"address":"t8","foreground":{"argv":["/Users/c/.local/bin/herdr-reviewq","tui"]}}"#));
-        let (ws, outcome) = crate::ui::ensure(&app(&fake), &dir.path().join("ui.lock"), dir.path(), far(), Duration::from_secs(1)).unwrap();
-        assert!(ws.starts_with("rq-panel-"));
-        assert_eq!(outcome, crate::ui::UiOutcome::AlreadyOpen);
-        let run = fake.calls.borrow()[1].clone();
-        assert!(run.args.ends_with(&["--".to_string(), "/Users/c/.local/bin/herdr-reviewq".into(), "tui".into()]), "{:?}", run.args);
-        assert!(fake.lines().iter().filter(|l| l.starts_with("hc run")).count() == 1, "sem shell vazio ao lado do painel");
-    }
 
-    #[test]
-    fn app_ensure_reuses_the_panel_space_and_reopens_a_closed_tui() {
-        let dir = tempfile::tempdir().unwrap();
-        let fake = FakeRunner::new();
-        fake.on("herdr-app ls", Output::ok(&spaces(&[("sp1", "linkana", true), ("rq-panel-1", "reviewq", false)])));
-        fake.on("hc ls", Output::ok(r#"{"terminals":[{"address":"t2","state":"live"}]}"#));
-        fake.on("hc get t2", Output::ok(r#"{"address":"t2","foreground":{"argv":["-zsh"]}}"#));
-        fake.on("hc run", Output::ok(r#"{"address":"t9"}"#));
-        fake.on("herdr-app ls", Output::ok(&spaces(&[("sp1", "linkana", true), ("rq-panel-1", "reviewq", false)])));
-        fake.on("hc ls", Output::ok(r#"{"terminals":[{"address":"t2","state":"live"},{"address":"t9","state":"live"}]}"#));
-        fake.on("hc get t2", Output::ok(r#"{"address":"t2","foreground":{"argv":["-zsh"]}}"#));
-        fake.on("hc get t9", Output::ok(r#"{"address":"t9","argv":["/Users/c/.local/bin/herdr-reviewq","tui"]}"#));
-        let (ws, outcome) = crate::ui::ensure(&app(&fake), &dir.path().join("ui.lock"), dir.path(), far(), Duration::from_secs(1)).unwrap();
-        assert_eq!((ws.as_str(), outcome), ("rq-panel-1", crate::ui::UiOutcome::Opened));
-        assert!(fake.lines().iter().any(|l| l.starts_with("hc run") && l.contains("herdr.space=rq-panel-1")));
-    }
 
     #[test]
     fn app_lists_known_agents_with_their_foreground_folder() {

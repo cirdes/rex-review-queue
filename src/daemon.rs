@@ -4,7 +4,7 @@ use crate::executor::{self, Ctx};
 use crate::facts::{self, divergence, Divergence};
 use crate::git::Git;
 use crate::github::{self, ErrorKind, FetchError, RepoSnapshot, Snapshot};
-use crate::herdr::{Herdr, UiRouting};
+use crate::mux::{Mux, MuxError, Offline};
 use crate::paths::Paths;
 use crate::reconcile::{reconcile, Input, Op};
 use crate::requests::{self, Entry, Request, RequestKind};
@@ -58,51 +58,63 @@ pub struct Daemon<'a> {
     paths: Paths,
     cfg: Config,
     runner: &'a dyn Runner,
-    herdr: &'a dyn Herdr,
-    /// Cliente herdr do painel (timeout curto por chamada); por padrão o mesmo `herdr`.
-    ui_herdr: &'a dyn Herdr,
+    /// O Rex de verdade. Só é usado depois de `rex_verified` (ver `mux()`).
+    rex: &'a dyn Mux,
+    /// A revision do servidor já foi conferida. Até lá o Rex conta como ausente.
+    pub(crate) rex_verified: bool,
+    /// Erro que obriga o daemon a parar (Rex abaixo da revision mínima).
+    pub fatal: Option<String>,
     pub state: State,
     job: Option<SetupJob>,
     job_pid: Option<u32>,
     last_poll: Option<Instant>,
     last_prune: Option<Instant>,
-    last_notify_try: Option<Instant>,
-    pub(crate) notify_backoff: Duration,
     wrap: Wrap,
     pub(crate) counter_requested: bool,
-    /// O painel já foi garantido nesta execução (depois disso o daemon não o recria).
-    pub(crate) panel_ensured: bool,
-    panel_alerted: bool,
-    /// Falhas seguidas do `ensure` do painel (o alerta só sai a partir da 2ª).
-    pub(crate) panel_failures: u32,
-    pub(crate) panel_next_try: Option<Instant>,
-    pub(crate) panel_backoff: Duration,
-    /// Já rodou um tick nesta execução (no primeiro, o painel vem antes do poll).
-    ticked: bool,
     last_extras: Option<Instant>,
     /// Sync pedido: coleta os extras no próximo tick, fora da cadência.
     pub(crate) extras_requested: bool,
-    last_window_check: Option<Instant>,
-    /// Já alertou que falta algo na janela; volta a alertar só depois de resolvido.
-    window_alerted: bool,
+    last_update_check: Option<Instant>,
 }
 
-/// Cadência da checagem do que falta na janela (o mod da janela remota).
-const WINDOW_CHECK_EVERY: Duration = Duration::from_secs(300);
+/// Cadência da comparação com a build mais nova da `main`.
+const UPDATE_CHECK_EVERY: Duration = Duration::from_secs(24 * 3600);
 
-/// Prazo total da coleta de extras (agentes, CI e meus PRs) num tick.
+/// Prazo total da coleta de extras (CI, pilhas, meus PRs e "Início") num tick.
 const EXTRAS_BUDGET: Duration = Duration::from_secs(30);
 
-/// Linha do log quando o painel fica de pé; registra a recuperação depois de falhas.
-fn panel_ok_message(failures: u32) -> String {
-    match failures {
-        0 => "reviewq panel ensured".into(),
-        n => format!("reviewq panel ensured (recovered after {n} failures in a row)"),
+/// API revision mínima do servidor Rex (a dos spikes e das fixtures).
+pub const MIN_REX_REVISION: u32 = 24;
+
+/// Conferência da partida. `Ok(true)`: Rex verificado; `Ok(false)`: Rex fora do ar, o daemon
+/// sobe e trata o Rex como ausente. Erro: o daemon não pode rodar.
+pub fn check_start(mux: &dyn Mux, old_agent_loaded: bool) -> Result<bool> {
+    if old_agent_loaded {
+        bail!("the herdr-reviewq daemon (dev.cirdes.herdr-reviewq) is still loaded; run `herdr-reviewq service uninstall` first, so both daemons never manage the same worktrees");
+    }
+    rex_revision_ok(mux)
+}
+
+/// `Ok(true)` com revision suficiente, `Ok(false)` sem resposta utilizável, erro abaixo da mínima.
+fn rex_revision_ok(mux: &dyn Mux) -> Result<bool> {
+    match mux.server_api_revision() {
+        Ok(r) if r >= MIN_REX_REVISION => Ok(true),
+        Ok(r) => bail!(
+            "Rex API revision {r} is below the minimum {MIN_REX_REVISION}; update Rex.app on this machine and start the daemon again"
+        ),
+        Err(e @ MuxError::Unreachable(_)) => {
+            info(&format!("Rex: {e}; syncing without Rex until it answers"));
+            Ok(false)
+        }
+        Err(e) => {
+            info(&format!("Rex: could not read the API revision: {e}; treating Rex as absent"));
+            Ok(false)
+        }
     }
 }
 
 impl<'a> Daemon<'a> {
-    pub fn new(paths: Paths, cfg: Config, runner: &'a dyn Runner, herdr: &'a dyn Herdr, wrap: Wrap) -> Result<Self> {
+    pub fn new(paths: Paths, cfg: Config, runner: &'a dyn Runner, rex: &'a dyn Mux, wrap: Wrap) -> Result<Self> {
         let (mut state, corrupt) = State::load(&paths.state_file())?;
         if let Some(p) = corrupt {
             let m = format!("state.json corrupted; set aside at {} and the state restarted empty", p.display());
@@ -113,27 +125,19 @@ impl<'a> Daemon<'a> {
             paths,
             cfg,
             runner,
-            herdr,
-            ui_herdr: herdr,
+            rex,
+            rex_verified: false,
+            fatal: None,
             state,
             job: None,
             job_pid: None,
             last_poll: None,
             last_prune: None,
-            last_notify_try: None,
-            notify_backoff: Duration::from_secs(30),
             wrap,
             counter_requested: false,
-            panel_ensured: false,
-            panel_alerted: false,
-            panel_failures: 0,
-            panel_next_try: None,
-            panel_backoff: Duration::from_secs(30),
-            ticked: false,
             last_extras: None,
             extras_requested: false,
-            last_window_check: None,
-            window_alerted: false,
+            last_update_check: None,
         };
         d.recover_orphan_setup();
         if let Err(e) = d.save() {
@@ -142,49 +146,40 @@ impl<'a> Daemon<'a> {
         Ok(d)
     }
 
-    /// Cliente herdr usado para garantir o painel (o daemon passa um com timeout curto).
-    pub fn with_ui_herdr(mut self, ui_herdr: &'a dyn Herdr) -> Self {
-        self.ui_herdr = ui_herdr;
+    /// O Rex que as operações usam: o de verdade depois de verificado, senão `Offline`.
+    fn mux(&self) -> &'a dyn Mux {
+        if self.rex_verified { self.rex } else { &Offline }
+    }
+
+    /// Marca o Rex como já verificado na partida.
+    pub fn with_rex_verified(mut self, verified: bool) -> Self {
+        self.rex_verified = verified;
         self
+    }
+
+    /// Enquanto o Rex não foi verificado, tenta de novo a cada ciclo de sync. Revision baixa
+    /// descoberta agora é fatal, como na partida.
+    pub(crate) fn verify_rex(&mut self) {
+        if self.rex_verified || self.fatal.is_some() {
+            return;
+        }
+        match rex_revision_ok(self.rex) {
+            Ok(true) => {
+                info("Rex answered; closing sessions and detecting agents again");
+                self.rex_verified = true;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let m = format!("{e:#}");
+                info(&m);
+                self.state.push_alert(m.clone());
+                self.fatal = Some(m);
+            }
+        }
     }
 
     fn save(&self) -> Result<()> {
         self.state.save(&self.paths.state_file())
-    }
-
-    /// Tenta garantir o painel `reviewq`. Falha: nova tentativa com backoff (30 s dobrando até
-    /// 300 s), o que também limita panes reabertos em sequência; um único alerta por execução, só a
-    /// partir da 2ª falha seguida (uma falha isolada, como o herdr ainda subindo, não incomoda).
-    pub(crate) fn ensure_panel_now(&mut self) {
-        let deadline = Instant::now() + crate::ui::ENSURE_TOTAL;
-        match crate::ui::ensure(self.ui_herdr, &self.paths.ui_lock_file(), &self.paths.home, deadline, crate::ui::LOCK_WAIT_DAEMON) {
-            Ok(_) => {
-                self.panel_ensured = true;
-                self.panel_next_try = None;
-                info(&panel_ok_message(self.panel_failures));
-                self.panel_failures = 0;
-            }
-            Err(e) => {
-                self.panel_failures += 1;
-                info(&format!("reviewq panel (failure {} in a row): {e:#}", self.panel_failures));
-                if self.panel_failures >= 2 && !self.panel_alerted {
-                    self.state.push_alert(format!("reviewq panel did not open: {e:#}"));
-                    self.panel_alerted = true;
-                    if let Err(e) = self.save() {
-                        info(&format!("{e:#}"));
-                    }
-                }
-                self.panel_next_try = Some(Instant::now() + self.panel_backoff);
-                self.panel_backoff = (self.panel_backoff * 2).min(Duration::from_secs(300));
-            }
-        }
-    }
-
-    pub(crate) fn maybe_ensure_panel(&mut self) {
-        if self.panel_ensured || stopping() || self.panel_next_try.is_some_and(|t| Instant::now() < t) {
-            return;
-        }
-        self.ensure_panel_now();
     }
 
     fn recover_orphan_setup(&mut self) {
@@ -220,43 +215,14 @@ impl<'a> Daemon<'a> {
         if stopping() {
             return;
         }
-        // ao subir, o painel não espera a criação de worktrees nem a coleta (depois do sucesso,
-        // a chamada do fim do tick é barata: `panel_ensured` curto-circuita)
-        if !std::mem::replace(&mut self.ticked, true) {
-            self.maybe_ensure_panel();
-        }
         let due = self.last_poll.is_none_or(|t| t.elapsed() >= Duration::from_secs(self.cfg.poll_interval_secs));
         if force || due {
             self.last_poll = Some(Instant::now());
             self.poll_cycle();
         }
         self.drive_setup();
-        self.deliver_notifications();
         self.maybe_collect_reviews_today();
         self.maybe_collect_extras();
-        self.maybe_ensure_panel();
-        self.maybe_check_window();
-    }
-
-    /// Um alerta por problema: se some e volta, alerta de novo.
-    pub(crate) fn maybe_check_window(&mut self) {
-        if self.last_window_check.is_some_and(|t| t.elapsed() < WINDOW_CHECK_EVERY) {
-            return;
-        }
-        self.last_window_check = Some(Instant::now());
-        match self.herdr.window_warning() {
-            Ok(Some(m)) if !self.window_alerted => {
-                info(&m);
-                self.state.push_alert(m);
-                self.window_alerted = true;
-                if let Err(e) = self.save() {
-                    info(&format!("{e:#}"));
-                }
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => self.window_alerted = false,
-            Err(e) => info(&format!("window check: {e:#}")),
-        }
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -281,18 +247,46 @@ impl<'a> Daemon<'a> {
             _ => None,
         });
         match auth_err {
+            // condição ativa do painel (registro 7501 da raiz); o daemon não notifica mais
             Some(msg) if !self.state.auth_error_notified => {
                 info(&format!("gh not authenticated: {msg}"));
-                if self.herdr.notify("reviewq: gh not authenticated", "run gh auth login on this machine", &self.cfg.notify.sound).is_ok() {
-                    self.state.auth_error_notified = true;
-                }
+                self.state.auth_error_notified = true;
             }
             None => self.state.auth_error_notified = false,
             _ => {}
         }
     }
 
+    /// `sessions.json` ilegível: o daemon isola o arquivo, recomeça vazio e grava a condição
+    /// ativa. Ela some quando o arquivo volta a ser gravado com sucesso depois disso.
+    pub(crate) fn check_sessions_file(&mut self) {
+        let file = self.paths.sessions_file();
+        match crate::sessions::quarantine_if_corrupt(&self.paths, Utc::now()) {
+            Ok(Some((c, moved))) => {
+                let m = format!("{c}; set aside at {} and restarted empty (sessions open before stay open; close them by hand)", moved.display());
+                info(&m);
+                self.state.push_alert(m);
+                self.state.sessions_corrupt_since = Some(Utc::now());
+            }
+            Err(e) => info(&format!("sessions.json check: {e:#}")),
+            Ok(None) => {
+                let Some(since) = self.state.sessions_corrupt_since else { return };
+                let written: Option<DateTime<Utc>> =
+                    std::fs::metadata(&file).and_then(|m| m.modified()).ok().map(Into::into);
+                if written.is_some_and(|w| w > since) {
+                    info("sessions.json written again; corruption condition cleared");
+                    self.state.sessions_corrupt_since = None;
+                }
+            }
+        }
+    }
+
     pub fn poll_cycle(&mut self) {
+        self.verify_rex();
+        if self.fatal.is_some() {
+            return;
+        }
+        self.check_sessions_file();
         let snapshot = self.snapshot();
         self.handle_auth(&snapshot);
         let busy = self.job.as_ref().map(|j| j.key.to_string());
@@ -344,7 +338,7 @@ impl<'a> Daemon<'a> {
             }
             info(&format!("{op:?}"));
             let worktrees = crate::worktrees::GitWorktrees::new(self.runner);
-            let ctx = Ctx { cfg: &self.cfg, runner: self.runner, herdr: self.herdr, worktrees: &worktrees, now: Utc::now() };
+            let ctx = Ctx { cfg: &self.cfg, runner: self.runner, worktrees: &worktrees, mux: self.mux(), paths: &self.paths, now: Utc::now() };
             match executor::run_op(&ctx, &mut self.state, &op) {
                 Ok(Some(note)) => info(&format!("{key}: {note}")),
                 Ok(None) => {}
@@ -458,26 +452,40 @@ impl<'a> Daemon<'a> {
         self.extras_requested = false;
         self.last_extras = Some(Instant::now());
         self.collect_extras_with(Utc::now(), &stopping);
+        if !stopping() && self.last_update_check.is_none_or(|t| t.elapsed() >= UPDATE_CHECK_EVERY) {
+            self.last_update_check = Some(Instant::now());
+            self.check_update(crate::update::local_sha());
+        }
     }
 
-    /// Agentes, CI, PRs abertos (pilhas) e meus PRs. Roda fora do ciclo de reviews e só escreve
-    /// metadados: trabalha numa cópia e, no fim, copia de volta apenas `ci`, `work_started_at`,
-    /// `work_agent`, `open_prs` e `my_prs`. Encerramento no meio descarta tudo; falhas ficam no
-    /// próprio dado e no log.
+    /// Compara com a build mais nova da `main` e grava `update_available` (o painel mostra no
+    /// rodapé). Nunca instala. Falha (rede, gh) mantém o valor anterior.
+    pub(crate) fn check_update(&mut self, local: &str) {
+        match crate::update::check_against(self.runner, local) {
+            Ok(found) if found != self.state.update_available => {
+                if let Some(sha) = &found {
+                    info(&format!("new rrq build available: {}", crate::update::short(sha)));
+                }
+                self.state.update_available = found;
+                if let Err(e) = self.save() {
+                    info(&format!("{e:#}"));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => info(&format!("update check: {e:#}")),
+        }
+    }
+
+    /// CI, PRs abertos (pilhas), meus PRs e, com o que sobrar do orçamento, o "Início" (agentes
+    /// nas sessões do Rex). Roda fora do ciclo de reviews e só escreve metadados: trabalha numa
+    /// cópia e, no fim, copia de volta apenas `ci`, `work_started_at`, `work_agent`, `open_prs` e
+    /// `my_prs`. Encerramento no meio descarta tudo; falhas ficam no próprio dado e no log.
     pub(crate) fn collect_extras_with(&mut self, now: DateTime<Utc>, stop: &dyn Fn() -> bool) {
         if stop() {
             return;
         }
         let deadline = Instant::now() + EXTRAS_BUDGET;
         let mut next = self.state.clone();
-        match self.herdr.list_agents(deadline) {
-            Ok(agents) => {
-                for k in crate::agents::apply_agents(&mut next, &agents, now) {
-                    info(&format!("{k}: agent open in the worktree"));
-                }
-            }
-            Err(e) => info(&format!("herdr agents: {e:#}")),
-        }
         let repos: Vec<String> = self.cfg.repos.iter().map(|r| r.name.clone()).collect();
         for repo in &repos {
             if stop() {
@@ -536,6 +544,17 @@ impl<'a> Daemon<'a> {
                         }
                     }
                 }
+            }
+        }
+        if stop() {
+            return;
+        }
+        // "Início" por último: CI e pilhas têm prioridade no orçamento
+        if self.rex_verified && Instant::now() < deadline {
+            let (sessions, _) = crate::sessions::load_for_panel(&self.paths.sessions_file());
+            let agents = crate::agents::scan(self.mux(), &sessions, &next, deadline);
+            for k in crate::agents::apply_agents(&mut next, &agents, now) {
+                info(&format!("{k}: agent open in the worktree"));
             }
         }
         if stop() {
@@ -668,14 +687,12 @@ impl<'a> Daemon<'a> {
             .cfg
             .repo(&key.repo)
             .and_then(|repo| facts::collect(self.runner, &rec.path, &repo.disposable_ignored).ok());
-        let on_ready = self.cfg.notify.on_ready;
         let Some(rec) = self.state.get_mut(&key) else { return };
         match status {
             JobStatus::Succeeded => {
                 info(&format!("{key}: ready"));
                 rec.phase = Phase::Ready;
                 rec.prepared_sha = rec.managed_sha.clone();
-                rec.notify_pending = on_ready;
             }
             JobStatus::Failed { step, reason } => {
                 info(&format!("{key}: setup failed at {step}: {reason}"));
@@ -687,39 +704,6 @@ impl<'a> Daemon<'a> {
             if let Some(Divergence::Diverged(reason)) = facts.as_ref().and_then(|f| divergence(rec, f)) {
                 rec.ownership = Ownership::Adopted { reason: format!("after setup: {reason}"), at: Utc::now() };
                 rec.warning = Some("the worktree is not clean; it will not be removed automatically".into());
-            }
-        }
-    }
-
-    pub fn deliver_notifications(&mut self) {
-        if self.last_notify_try.is_some_and(|t| t.elapsed() < self.notify_backoff) {
-            return;
-        }
-        let pending: Vec<PrKey> = self
-            .state
-            .prs
-            .values()
-            .filter(|r| r.notify_pending && r.phase == Phase::Ready)
-            .map(|r| r.key.clone())
-            .collect();
-        if pending.is_empty() {
-            return;
-        }
-        self.last_notify_try = Some(Instant::now());
-        for key in pending {
-            let Some(rec) = self.state.get(&key).cloned() else { continue };
-            if let Err(e) = self.herdr.notify(&format!("#{} ready for review", key.number), &rec.title, &self.cfg.notify.sound) {
-                info(&format!("{key}: notification failed: {e:#}"));
-                continue;
-            }
-            if let Some(ws) = &rec.workspace_id {
-                let _ = self.herdr.report_metadata(ws, &format!("#{} ready", key.number));
-            }
-            if let Some(r) = self.state.get_mut(&key) {
-                r.notify_pending = false;
-            }
-            if let Err(e) = self.save() {
-                info(&format!("{e:#}"));
             }
         }
     }
@@ -844,7 +828,6 @@ impl<'a> Daemon<'a> {
                         rec.work_agent = None;
                         rec.managed_sha = None;
                         rec.prepared_sha = None;
-                        rec.workspace_id = None;
                         Ok(format!("{key}: will be recreated in the next cycle"))
                     }
                     _ => bail!("{key} is neither failed nor blocked without a worktree"),
@@ -866,7 +849,7 @@ impl<'a> Daemon<'a> {
     fn release(&mut self, key: &PrKey) -> Result<String> {
         self.cancel_setup_of(key);
         let worktrees = crate::worktrees::GitWorktrees::new(self.runner);
-            let ctx = Ctx { cfg: &self.cfg, runner: self.runner, herdr: self.herdr, worktrees: &worktrees, now: Utc::now() };
+        let ctx = Ctx { cfg: &self.cfg, runner: self.runner, worktrees: &worktrees, mux: self.mux(), paths: &self.paths, now: Utc::now() };
         executor::release(&ctx, &mut self.state, key)
     }
 
@@ -905,48 +888,17 @@ pub fn run(paths: Paths) -> Result<()> {
     crate::applog::init(paths.log_file());
     let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(paths.lock_file())?;
     lock.try_lock_exclusive().context("another daemon is already running (daemon.lock)")?;
-    let mut cfg = Config::load(&paths.config_file, &paths.home)?;
+    let cfg = Config::load(&paths.config_file, &paths.home)?;
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
     }
     let runner = RealRunner;
-    // o painel usa a sessão da config (nunca o ambiente) com timeout curto por chamada
-    let routing = UiRouting { bin: "herdr".into(), session: cfg.herdr_session.clone() };
-    // A escolha vale até o daemon reiniciar: os ids dos workspaces no estado são de um backend só.
-    // No login o Herdr pode ainda não estar de pé; sem sinal nenhum, espera em vez de chutar.
-    let mut waiting_logged = false;
-    let why = loop {
-        let mut probe = cfg.clone();
-        if let Some(why) = crate::herdr::resolve_backend(&mut probe, &runner, &routing, &paths.home, false) {
-            cfg = probe;
-            break why;
-        }
-        if stopping() {
-            info("daemon stopped before finding a Herdr");
-            return Ok(());
-        }
-        if !waiting_logged {
-            info("backend auto: no Herdr running and no window listening; waiting for one to show up");
-            waiting_logged = true;
-        }
-        for _ in 0..10 {
-            if stopping() {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-    };
-    let backend = match cfg.backend {
-        crate::config::Backend::HerdrApp => "herdr-app",
-        _ => "herdr",
-    };
-    info(&format!("backend {backend} ({why})"));
-    let herdr = crate::herdr::client(&cfg, &runner, &routing, &paths.home, Duration::from_secs(60));
-    let ui_herdr = crate::herdr::client(&cfg, &runner, &routing, &paths.home, crate::ui::UI_CALL_TIMEOUT);
-    let mut d = Daemon::new(paths, cfg, &runner, herdr.as_ref(), mise_wrap)?.with_ui_herdr(ui_herdr.as_ref());
+    let rex = crate::rex::RexCli::new(&runner, &cfg.rex.bin);
+    let verified = check_start(&rex, crate::service::old_agent_loaded()).inspect_err(|e| info(&format!("{e:#}")))?;
+    let mut d = Daemon::new(paths, cfg, &runner, &rex, mise_wrap)?.with_rex_verified(verified);
     info("daemon iniciado");
-    while !stopping() {
+    while !stopping() && d.fatal.is_none() {
         d.tick();
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -957,14 +909,17 @@ pub fn run(paths: Paths) -> Result<()> {
     }
     info("daemon encerrado");
     drop(lock);
-    Ok(())
+    match d.fatal {
+        Some(m) => bail!("{m}"),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::github::page_json;
-    use crate::herdr::FakeHerdr;
+    use crate::mux::fake::*;
     use crate::runner::{FakeRunner, Output};
     use crate::testutil::{config, fixture, git};
     use std::os::unix::process::CommandExt;
@@ -1008,10 +963,10 @@ mod tests {
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
         pending(&runner, &fx.remote_sha("feat/x"));
-        let herdr = FakeHerdr::new();
+        let rex = FakeMux::new();
         let mut cfg = config(&fx, CLEAN_SETUP);
         cfg.remove_grace_secs = 0;
-        let mut d = Daemon::new(paths.clone(), cfg, &runner, &herdr, sh).unwrap();
+        let mut d = Daemon::new(paths.clone(), cfg, &runner, &rex, sh).unwrap();
         let key = PrKey::new("o/r", 7);
 
         d.tick();
@@ -1022,9 +977,7 @@ mod tests {
         });
         assert_eq!(d.state.get(&key).unwrap().ownership, Ownership::Managed);
         assert!(d.state.setup_process.is_none());
-        d.deliver_notifications();
-        assert!(herdr.notifications.borrow().iter().any(|n| n.contains("#7")));
-        assert!(!d.state.get(&key).unwrap().notify_pending);
+        assert!(!d.state.get(&key).unwrap().notify_pending, "o rrq não grava mais o legado");
         let wt = d.state.get(&key).unwrap().path.clone();
         assert!(wt.join("node_modules/.setup-done").exists());
         assert!(State::read(&paths.state_file()).unwrap().get(&key).is_some());
@@ -1042,8 +995,8 @@ mod tests {
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
         pending(&runner, &fx.remote_sha("feat/x"));
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "echo mudou >> README"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "echo mudou >> README"), &runner, &rex, sh).unwrap();
         let key = PrKey::new("o/r", 7);
         d.tick();
         wait_until(|| {
@@ -1127,40 +1080,12 @@ mod tests {
     const VIEWER: &str = r#"{"data":{"viewer":{"login":"cirdes"}}}"#;
 
     #[test]
-    fn window_warning_alerts_once_per_episode() {
-        let fx = fixture("feat/x");
-        let paths = Paths::from_home(fx.root.join("home"));
-        let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
-        let alerts = |d: &Daemon| d.state.alerts.iter().filter(|a| a.message.contains("janela")).count();
-        let check = |d: &mut Daemon| {
-            d.last_window_check = None;
-            d.maybe_check_window();
-        };
-
-        *herdr.window_warning.borrow_mut() = Some("nenhuma janela ouvindo".into());
-        check(&mut d);
-        check(&mut d);
-        assert_eq!(alerts(&d), 1, "o mesmo problema alerta uma vez");
-
-        *herdr.window_warning.borrow_mut() = None;
-        check(&mut d);
-        *herdr.window_warning.borrow_mut() = Some("nenhuma janela ouvindo".into());
-        check(&mut d);
-        assert_eq!(alerts(&d), 2, "resolvido e de volta: alerta de novo");
-
-        d.maybe_check_window();
-        assert_eq!(alerts(&d), 2, "dentro da cadência não checa");
-    }
-
-    #[test]
     fn counter_success_failure_and_midnight() {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
 
         // sucesso: 2 PRs hoje (o review de ontem não conta)
         runner.gh.on("viewer", Output::ok(VIEWER));
@@ -1197,8 +1122,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         runner.gh.on("viewer", Output::ok(VIEWER));
         // 4 antes da meia-noite SP; 5 já é do dia 8 (03:00:30Z), depois do as_of
         runner.gh.on("reviewed-by:cirdes", Output::ok(&reviewed(vec![
@@ -1214,12 +1139,12 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
+        let rex = FakeMux::new();
         let mut cfg = config(&fx, "true");
         let mut second = cfg.repos[0].clone();
         second.name = "o/r2".into();
         cfg.repos.push(second);
-        let mut d = Daemon::new(paths, cfg, &runner, &herdr, sh).unwrap();
+        let mut d = Daemon::new(paths, cfg, &runner, &rex, sh).unwrap();
         let both = vec!["o/r".to_string(), "o/r2".to_string()];
 
         runner.gh.on("viewer", Output::ok(VIEWER));
@@ -1244,8 +1169,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         // falha que terminou 80 s depois do início: backoff conta do fim
         runner.gh.on("viewer", Output::fail(1, "HTTP 502"));
         d.collect_reviews_today_timed(at(12, 0), Duration::from_secs(80));
@@ -1269,8 +1194,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         d.state.reviews_today.last_success = Some(crate::state::ReviewsTodaySuccess {
             day: chrono::NaiveDate::from_ymd_opt(2026, 10, 7).unwrap(), count: 5,
             per_repo: Default::default(), as_of: at(12, 0), viewer: "outra".into(), repos: vec!["o/r".into()] });
@@ -1285,8 +1210,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         runner.gh.on("viewer", Output::ok(VIEWER));
         runner.gh.on("reviewed-by:cirdes", Output::ok(&reviewed(vec![approved_today(1, "2026-10-07T12:00:00Z")])));
         d.collect_reviews_today_at(at(12, 0));
@@ -1301,48 +1226,13 @@ mod tests {
         assert!(d.state.reviews_today.backoff_until.is_none());
     }
 
-    /// Runner que anota, na primeira chamada ao `gh`, quantos workspaces o painel já criou.
-    struct OrderProbe<'h> {
-        gh: FakeRunner,
-        herdr: &'h FakeHerdr,
-        panel_before_first_gh: std::cell::Cell<Option<usize>>,
-    }
-
-    impl Runner for OrderProbe<'_> {
-        fn run(&self, c: &Cmd) -> Result<crate::runner::Output> {
-            if c.program == "gh" {
-                if self.panel_before_first_gh.get().is_none() {
-                    self.panel_before_first_gh.set(Some(self.herdr.created_cwds.borrow().len()));
-                }
-                self.gh.run(c)
-            } else {
-                RealRunner.run(c)
-            }
-        }
-    }
-
-    #[test]
-    fn first_tick_ensures_panel_before_polling() {
-        let fx = fixture("feat/x");
-        let paths = Paths::from_home(fx.root.join("home"));
-        let herdr = FakeHerdr::new();
-        let runner = OrderProbe { gh: FakeRunner::new(), herdr: &herdr, panel_before_first_gh: Default::default() };
-        runner.gh.on("q=repo:o/r", Output::ok(&page_json("cirdes", &[], None)));
-        runner.gh.on("viewer", Output::ok(VIEWER));
-        runner.gh.on("reviewed-by:cirdes", Output::ok(&reviewed(vec![])));
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
-        d.tick();
-        assert!(d.panel_ensured);
-        assert_eq!(runner.panel_before_first_gh.get(), Some(1), "o painel sobe antes da primeira chamada ao gh");
-    }
-
     #[test]
     fn sync_request_triggers_counter_but_retry_does_not() {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         let mut rec = crate::state::PrRecord::fixture("o/r", 99, "feat/x", "s");
         rec.phase = Phase::Failed { step: "setup".into(), reason: "x".into() };
         d.state.insert(rec);
@@ -1363,8 +1253,8 @@ mod tests {
         none_pending(&runner);
         runner.gh.on("viewer", Output::ok(VIEWER));
         runner.gh.on("reviewed-by:cirdes", Output::ok(&reviewed(vec![])));
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         for _ in 0..3 {
             requests::write(&paths.requests_dir(), RequestKind::Sync, None).unwrap();
         }
@@ -1382,8 +1272,8 @@ mod tests {
         let runner = Routing { gh: FakeRunner::new() };
         none_pending(&runner);
         none_pending(&runner);
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         let polls = || runner.gh.lines().iter().filter(|l| l.contains("review-requested")).count();
         d.tick();
         assert_eq!(polls(), 1);
@@ -1400,8 +1290,8 @@ mod tests {
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
         none_pending(&runner);
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         std::fs::create_dir_all(paths.requests_dir()).unwrap();
         std::fs::write(paths.requests_dir().join("lixo.json"), "???").unwrap();
         requests::write(&paths.requests_dir(), RequestKind::Release, Some("o/r#99".into())).unwrap();
@@ -1417,8 +1307,8 @@ mod tests {
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
         none_pending(&runner);
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         let mut rec = crate::state::PrRecord::fixture("o/r", 5, "feat/x", "s");
         rec.ownership = Ownership::Adopted { reason: "x".into(), at: Utc::now() };
         rec.phase = Phase::Blocked { reason: "removal canceled".into() };
@@ -1436,8 +1326,8 @@ mod tests {
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
         none_pending(&runner);
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         requests::write(&paths.requests_dir(), RequestKind::ReleaseAll, None).unwrap();
         d.process_requests();
         let last = d.state.last_requests.last().unwrap();
@@ -1465,44 +1355,21 @@ mod tests {
     }
 
     #[test]
-    fn auth_failure_notifies_once_and_keeps_records() {
+    fn auth_failure_is_flagged_and_keeps_records() {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
         for _ in 0..2 {
             runner.gh.on("q=repo:o/r", Output::fail(1, "please run:  gh auth login"));
         }
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         d.state.insert(crate::state::PrRecord::fixture("o/r", 1, "feat/x", "s"));
         d.poll_cycle();
+        assert!(d.state.auth_error_notified, "condição ativa para o painel");
         d.poll_cycle();
-        assert_eq!(herdr.notifications.borrow().len(), 1);
+        assert!(d.state.auth_error_notified);
         assert!(d.state.get(&PrKey::new("o/r", 1)).is_some());
-    }
-
-    #[test]
-    fn failed_notification_is_retried() {
-        let fx = fixture("feat/x");
-        let paths = Paths::from_home(fx.root.join("home"));
-        let runner = Routing { gh: FakeRunner::new() };
-        pending(&runner, &fx.remote_sha("feat/x"));
-        let herdr = FakeHerdr::new();
-        herdr.fail_notify.set(true);
-        let mut d = Daemon::new(paths, config(&fx, CLEAN_SETUP), &runner, &herdr, sh).unwrap();
-        d.notify_backoff = Duration::ZERO;
-        let key = PrKey::new("o/r", 7);
-        d.tick();
-        wait_until(|| {
-            d.drive_setup();
-            d.state.get(&key).unwrap().phase == Phase::Ready
-        });
-        d.deliver_notifications();
-        assert!(d.state.get(&key).unwrap().notify_pending);
-        herdr.fail_notify.set(false);
-        d.deliver_notifications();
-        assert!(!d.state.get(&key).unwrap().notify_pending);
-        assert_eq!(herdr.notifications.borrow().len(), 1);
     }
 
     #[test]
@@ -1512,8 +1379,8 @@ mod tests {
         std::fs::create_dir_all(&paths.state_dir).unwrap();
         std::fs::write(paths.state_file(), "{{{").unwrap();
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         assert!(d.state.prs.is_empty());
         assert!(d.state.alerts.iter().any(|a| a.message.contains("corrupted")));
     }
@@ -1534,8 +1401,8 @@ mod tests {
         };
         previous.save(&paths.state_file()).unwrap();
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         assert!(orphan.wait_timeout(Duration::from_secs(3)).unwrap().is_some(), "órfão continua vivo");
         assert!(d.state.setup_process.is_none());
         assert!(d.state.alerts.iter().any(|a| a.message.contains("orphan")));
@@ -1548,13 +1415,13 @@ mod tests {
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
         pending(&runner, &fx.remote_sha("feat/x"));
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         std::fs::set_permissions(&paths.state_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         d.poll_cycle();
         std::fs::set_permissions(&paths.state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(herdr.open.borrow().is_empty(), "criou worktree sem estado salvo");
         assert!(d.state.prs.is_empty());
+        assert!(!fx.root.join("w/o/r/pr-7").exists() && !config(&fx, "true").worktrees_dir.join("o/r/pr-7").exists(), "criou worktree sem estado salvo");
     }
 
     fn alive(pgid: i32) -> bool {
@@ -1562,11 +1429,11 @@ mod tests {
     }
 
     /// Daemon com setup lento rodando; devolve o pgid do job.
-    fn running_setup<'a>(fx: &crate::testutil::Fixture, paths: Paths, runner: &'a Routing, herdr: &'a FakeHerdr) -> (Daemon<'a>, i32) {
+    fn running_setup<'a>(fx: &crate::testutil::Fixture, paths: Paths, runner: &'a Routing, rex: &'a FakeMux) -> (Daemon<'a>, i32) {
         pending(runner, &fx.remote_sha("feat/x"));
         let mut cfg = config(fx, "sleep 30");
         cfg.remove_grace_secs = 0;
-        let mut d = Daemon::new(paths, cfg, runner, herdr, sh).unwrap();
+        let mut d = Daemon::new(paths, cfg, runner, rex, sh).unwrap();
         d.tick();
         wait_until(|| {
             d.drive_setup();
@@ -1582,8 +1449,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let (mut d, pgid) = running_setup(&fx, paths, &runner, &herdr);
+        let rex = FakeMux::new();
+        let (mut d, pgid) = running_setup(&fx, paths, &runner, &rex);
         none_pending(&runner);
         d.poll_cycle();
         assert!(d.job.is_none() && d.state.setup_process.is_none());
@@ -1595,8 +1462,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let (mut d, pgid) = running_setup(&fx, paths.clone(), &runner, &herdr);
+        let rex = FakeMux::new();
+        let (mut d, pgid) = running_setup(&fx, paths.clone(), &runner, &rex);
         requests::write(&paths.requests_dir(), RequestKind::Release, Some("o/r#7".into())).unwrap();
         d.process_requests();
         assert!(d.job.is_none() && d.state.setup_process.is_none());
@@ -1608,8 +1475,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let (mut d, pgid) = running_setup(&fx, paths.clone(), &runner, &herdr);
+        let rex = FakeMux::new();
+        let (mut d, pgid) = running_setup(&fx, paths.clone(), &runner, &rex);
         requests::write(&paths.requests_dir(), RequestKind::Adopt, Some("o/r#7".into())).unwrap();
         d.process_requests();
         assert!(d.job.is_none());
@@ -1628,8 +1495,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         requests::write(&paths.requests_dir(), RequestKind::Release, Some("o/r#99".into())).unwrap();
         std::fs::set_permissions(&paths.state_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         d.process_requests();
@@ -1647,8 +1514,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "sleep 30"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "sleep 30"), &runner, &rex, sh).unwrap();
         let mut old = crate::state::PrRecord::fixture("x/fora", 1, "b", "s");
         old.phase = Phase::Preparing;
         old.first_seen_at = Utc::now() - chrono::Duration::hours(1);
@@ -1678,81 +1545,12 @@ mod tests {
         };
         previous.save(&paths.state_file()).unwrap();
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         assert!(other.try_wait().unwrap().is_none(), "processo alheio foi morto");
         assert!(d.state.alerts.iter().any(|a| a.message.contains("could not confirm")));
         let _ = other.kill();
         let _ = other.wait();
-    }
-
-    #[test]
-    fn panel_is_ensured_once_per_start_with_backoff() {
-        let fx = fixture("feat/x");
-        let paths = Paths::from_home(fx.root.join("home"));
-        let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        herdr.fail_herdr.set(true);
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
-        let panel_alerts = |d: &Daemon| d.state.alerts.iter().filter(|a| a.message.contains("panel")).count();
-        d.ensure_panel_now();
-        assert!(!d.panel_ensured);
-        assert_eq!(panel_alerts(&d), 0, "uma falha isolada não vira alerta");
-        d.ensure_panel_now(); // 2ª falha seguida: alerta
-        assert_eq!(panel_alerts(&d), 1);
-        d.ensure_panel_now(); // 3ª: sem segundo alerta
-        assert_eq!(panel_alerts(&d), 1);
-        assert_eq!(d.panel_failures, 3);
-        herdr.fail_herdr.set(false);
-        d.ensure_panel_now();
-        assert!(d.panel_ensured);
-        assert_eq!(d.panel_failures, 0, "sucesso zera a sequência de falhas");
-        let n = herdr.workspaces.borrow().len();
-        // fechado pelo usuário depois do sucesso: o daemon não recria
-        herdr.workspaces.borrow_mut().clear();
-        d.maybe_ensure_panel();
-        assert_eq!(herdr.workspaces.borrow().len(), 0, "não recria depois do primeiro sucesso (era {n})");
-    }
-
-    #[test]
-    fn panel_success_message_records_recovery() {
-        assert_eq!(panel_ok_message(0), "reviewq panel ensured");
-        assert_eq!(panel_ok_message(2), "reviewq panel ensured (recovered after 2 failures in a row)");
-    }
-
-    #[test]
-    fn maybe_ensure_panel_honors_next_try_and_doubles_backoff() {
-        let fx = fixture("feat/x");
-        let paths = Paths::from_home(fx.root.join("home"));
-        let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        herdr.fail_list_workspaces.set(true);
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
-        assert_eq!(d.panel_backoff, Duration::from_secs(30));
-        d.maybe_ensure_panel(); // primeira tentativa: falha e agenda a próxima
-        let next = d.panel_next_try.expect("falha agenda nova tentativa");
-        assert!(next > Instant::now() + Duration::from_secs(25), "primeira espera é ~30 s");
-        assert_eq!(d.panel_backoff, Duration::from_secs(60));
-
-        // antes do prazo: não toca no herdr
-        herdr.fail_list_workspaces.set(false);
-        d.maybe_ensure_panel();
-        assert!(herdr.created_cwds.borrow().is_empty(), "antes de panel_next_try não chama o herdr");
-        assert!(!d.panel_ensured);
-
-        // prazo vencido (tempo injetado no campo): tenta e consegue
-        d.panel_next_try = Some(Instant::now() - Duration::from_secs(1));
-        d.maybe_ensure_panel();
-        assert!(d.panel_ensured);
-        assert_eq!(herdr.created_cwds.borrow().len(), 1);
-
-        // o backoff dobra até 300 s
-        let mut d2 = Daemon::new(Paths::from_home(fx.root.join("home2")), config(&fx, "true"), &runner, &herdr, sh).unwrap();
-        herdr.fail_herdr.set(true);
-        for _ in 0..6 {
-            d2.ensure_panel_now();
-        }
-        assert_eq!(d2.panel_backoff, Duration::from_secs(300));
     }
 
     #[test]
@@ -1761,8 +1559,8 @@ mod tests {
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
         pending(&runner, &fx.remote_sha("feat/x"));
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, CLEAN_SETUP), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, CLEAN_SETUP), &runner, &rex, sh).unwrap();
         let key = PrKey::new("o/r", 7);
         d.tick();
         wait_until(|| {
@@ -1821,6 +1619,14 @@ mod tests {
         }
     }
 
+    /// Sessão do PR no Rex falso com um bloco rodando `p`, registrada no sessions.json.
+    fn agent_in(rex: &FakeMux, paths: &Paths, key: &PrKey, p: crate::mux::Process) {
+        let sid = format!("session:{}", key.number);
+        rex.add_session(&sid, "#pr", vec![FakeBlock { id: "b1".into(), label: Some("claude".into()), process: Some(p), ..Default::default() }]);
+        let entry = crate::sessions::SessionEntry { session_id: sid, shell_block: "b1".into(), created_at: Utc::now(), entered_at: None };
+        crate::sessions::upsert(paths, key, entry).unwrap();
+    }
+
     fn extras_now() -> DateTime<Utc> {
         "2026-10-13T15:00:00Z".parse().unwrap()
     }
@@ -1858,14 +1664,10 @@ mod tests {
         runner.gh.on("is:open author:cirdes", Output::ok(&mine_json(&[40, 41])));
         runner.gh.on("created:>=2026-10-12T15:00:00Z", Output::ok(&count_json(2)));
         runner.gh.on("headRefName baseRefName", Output::ok(&open_json(&[(7, "feat/x", "main"), (9, "feat/y", "feat/x")])));
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap().with_rex_verified(true);
         let rec = crate::state::PrRecord::fixture("o/r", 7, "feat/x", "s7");
-        herdr.agents.borrow_mut().push(crate::herdr::AgentInfo {
-            agent: "codex".into(),
-            cwd: Some(rec.path.join("src")),
-            foreground_cwd: None,
-        });
+        agent_in(&rex, &paths, &rec.key, program_at("codex", &rec.path.join("src")));
         d.state.insert(rec);
         d.collect_extras_with(extras_now(), &no_stop);
         let r = d.state.get(&PrKey::new("o/r", 7)).unwrap();
@@ -1891,9 +1693,10 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() }; // nenhuma regra: todo gh falha
-        let herdr = FakeHerdr::new();
-        herdr.fail_agents.set(true);
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        rex.fail_on("view", MuxError::Unreachable("x".into()));
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap().with_rex_verified(true);
+        agent_in(&rex, &paths, &PrKey::new("o/r", 7), program_at("claude", std::path::Path::new("/tmp/reviewq-test/pr-7")));
         d.state.insert(crate::state::PrRecord::fixture("o/r", 7, "feat/x", "s7"));
         let mut leaving = crate::state::PrRecord::fixture("o/r", 8, "feat/y", "s8");
         leaving.remote = crate::state::Remote::NotPending;
@@ -1914,11 +1717,11 @@ mod tests {
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
         runner.gh.on("p7: pullRequest", Output::ok(&ci_json(7, "s7", "FAILURE")));
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap().with_rex_verified(true);
         let mut rec = crate::state::PrRecord::fixture("o/r", 7, "feat/x", "s7");
         rec.generation = 3;
-        herdr.agents.borrow_mut().push(crate::herdr::AgentInfo { agent: "claude".into(), cwd: Some(rec.path.clone()), foreground_cwd: None });
+        agent_in(&rex, &paths, &rec.key, program_at("claude", &rec.path));
         d.state.insert(rec);
         let before = d.state.clone();
         d.collect_extras_with(extras_now(), &no_stop);
@@ -1937,8 +1740,8 @@ mod tests {
         let runner = Routing { gh: FakeRunner::new() };
         runner.gh.on("query={ viewer { login } }", Output::ok(VIEWER));
         runner.gh.on("is:open author:cirdes", Output::fail(1, "boom"));
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         d.state.my_prs.viewer = Some("ana".into());
         d.state.my_prs.repos.insert("o/r".into(), mine_repo(&[1]));
         d.collect_extras_with(extras_now(), &no_stop);
@@ -1952,8 +1755,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         d.state.my_prs.viewer = Some("cirdes".into());
         d.state.my_prs.repos.insert("o/r".into(), mine_repo(&[1]));
         let before = d.state.my_prs.clone();
@@ -1968,8 +1771,8 @@ mod tests {
         let runner = Routing { gh: FakeRunner::new() };
         runner.gh.on("query={ viewer { login } }", Output::ok(VIEWER));
         runner.gh.on("is:open author:cirdes", Output::fail(1, "boom"));
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         d.state.my_prs.viewer = Some("cirdes".into());
         d.state.my_prs.repos.insert("o/r".into(), mine_repo(&[1]));
         d.collect_extras_with(extras_now(), &no_stop);
@@ -1983,8 +1786,8 @@ mod tests {
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
         runner.gh.on("headRefName baseRefName", Output::fail(1, "boom"));
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         d.state.open_prs.repos.insert("o/r".into(), open_repo(&[(1, "feat/a", "main")]));
         d.collect_extras_with(extras_now(), &no_stop);
         assert_eq!(d.state.open_prs.repos["o/r"], open_repo(&[(1, "feat/a", "main")]));
@@ -1998,8 +1801,8 @@ mod tests {
         runner.gh.on("query={ viewer { login } }", Output::ok(VIEWER));
         runner.gh.on("is:open author:cirdes", Output::ok(&mine_json(&[])));
         runner.gh.on("created:>=", Output::ok(&count_json(0)));
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
         d.state.my_prs.viewer = Some("cirdes".into());
         d.state.my_prs.repos.insert("x/y".into(), mine_repo(&[1]));
         d.state.my_prs.errors.insert("x/y".into(), "velho".into());
@@ -2015,10 +1818,10 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap().with_rex_verified(true);
         let rec = crate::state::PrRecord::fixture("o/r", 7, "feat/x", "s7");
-        herdr.agents.borrow_mut().push(crate::herdr::AgentInfo { agent: "claude".into(), cwd: Some(rec.path.clone()), foreground_cwd: None });
+        agent_in(&rex, &paths, &rec.key, program_at("claude", &rec.path));
         d.state.insert(rec);
         let before = d.state.clone();
         d.collect_extras_with(extras_now(), &|| true);
@@ -2031,8 +1834,8 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         let mut gone = crate::state::PrRecord::fixture("o/r", 5, "feat/x", "s");
         gone.path = fx.root.join("nao-existe");
         gone.created_branch = false;
@@ -2061,11 +1864,139 @@ mod tests {
         let fx = fixture("feat/x");
         let paths = Paths::from_home(fx.root.join("home"));
         let runner = Routing { gh: FakeRunner::new() };
-        let herdr = FakeHerdr::new();
-        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &herdr, sh).unwrap();
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
         assert!(!d.extras_requested);
         requests::write(&paths.requests_dir(), RequestKind::Sync, None).unwrap();
         d.process_requests_for_test();
         assert!(d.extras_requested);
+    }
+
+    // ---- partida e Rex ----
+
+    #[test]
+    fn start_refuses_old_agent_and_old_rex_but_not_an_absent_one() {
+        let rex = FakeMux::new();
+        assert!(check_start(&rex, false).unwrap(), "revision 24: verificado");
+        let err = format!("{:#}", check_start(&rex, true).unwrap_err());
+        assert!(err.contains("dev.cirdes.herdr-reviewq"), "{err}");
+        *rex.revision.borrow_mut() = 23;
+        let err = format!("{:#}", check_start(&rex, false).unwrap_err());
+        assert!(err.contains("23") && err.contains("24") && err.contains("update Rex"), "{err}");
+        rex.fail_on("server_api_revision", MuxError::Unreachable("exit 4".into()));
+        assert!(!check_start(&rex, false).unwrap(), "Rex fora do ar não impede a partida");
+    }
+
+    #[test]
+    fn unreachable_rex_keeps_syncing_and_never_removes_a_pr_with_session() {
+        let fx = fixture("feat/x");
+        let paths = Paths::from_home(fx.root.join("home"));
+        let runner = Routing { gh: FakeRunner::new() };
+        let rex = FakeMux::new();
+        rex.fail_on("server_api_revision", MuxError::Unreachable("exit 4".into()));
+        let mut cfg = config(&fx, CLEAN_SETUP);
+        cfg.remove_grace_secs = 0;
+        let mut d = Daemon::new(paths.clone(), cfg, &runner, &rex, sh).unwrap().with_rex_verified(false);
+        let key = PrKey::new("o/r", 7);
+        pending(&runner, &fx.remote_sha("feat/x"));
+        d.poll_cycle();
+        assert_eq!(d.state.get(&key).unwrap().phase, Phase::Preparing, "o sync segue sem o Rex");
+        wait_until(|| {
+            d.drive_setup();
+            d.state.get(&key).unwrap().phase == Phase::Ready
+        });
+        let wt = d.state.get(&key).unwrap().path.clone();
+        agent_in(&rex, &paths, &key, shell_at(&wt));
+
+        // saiu da fila com o Rex fora: a sessão não pode ser conferida, então nada sai
+        none_pending(&runner);
+        d.poll_cycle();
+        let r = d.state.get(&key).unwrap();
+        assert_eq!(r.phase, Phase::Removing);
+        assert!(r.leaving_blocked_by_session);
+        assert!(wt.exists());
+        assert!(!rex.calls.borrow().iter().any(|c| c == "view"), "Rex não verificado não é usado");
+
+        // o Rex voltou: verificado no ciclo seguinte, fecha a sessão ociosa e remove
+        rex.fail.borrow_mut().clear();
+        none_pending(&runner);
+        d.poll_cycle();
+        assert!(d.rex_verified);
+        assert!(d.state.get(&key).is_none());
+        assert!(!wt.exists());
+        assert!(rex.sessions.borrow().is_empty());
+    }
+
+    #[test]
+    fn rex_found_below_minimum_after_start_stops_the_daemon() {
+        let fx = fixture("feat/x");
+        let paths = Paths::from_home(fx.root.join("home"));
+        let runner = Routing { gh: FakeRunner::new() };
+        let rex = FakeMux::new();
+        *rex.revision.borrow_mut() = 23;
+        let mut d = Daemon::new(paths, config(&fx, "true"), &runner, &rex, sh).unwrap();
+        d.poll_cycle();
+        assert!(d.fatal.as_deref().is_some_and(|m| m.contains("23")), "{:?}", d.fatal);
+        assert!(runner.gh.lines().is_empty(), "nem sincroniza");
+    }
+
+    #[test]
+    fn corrupt_sessions_file_is_isolated_and_the_condition_clears_on_next_write() {
+        let fx = fixture("feat/x");
+        let paths = Paths::from_home(fx.root.join("home"));
+        let runner = Routing { gh: FakeRunner::new() };
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
+        std::fs::write(paths.sessions_file(), "{ não é json").unwrap();
+        d.check_sessions_file();
+        let since = d.state.sessions_corrupt_since.expect("condição ativa");
+        assert!(!paths.sessions_file().exists());
+        assert!(d.state.alerts.iter().any(|a| a.message.contains("corrupt") && a.message.contains("set aside")));
+        let moved = std::fs::read_dir(&paths.state_dir).unwrap().filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().contains("corrupt"));
+        assert!(moved, "a cópia corrompida fica para o autor");
+
+        d.check_sessions_file();
+        assert_eq!(d.state.sessions_corrupt_since, Some(since), "arquivo ausente não limpa");
+        std::thread::sleep(Duration::from_millis(20));
+        let entry = crate::sessions::SessionEntry { session_id: "s".into(), shell_block: "b".into(), created_at: Utc::now(), entered_at: None };
+        crate::sessions::upsert(&paths, &PrKey::new("o/r", 1), entry).unwrap();
+        d.check_sessions_file();
+        assert_eq!(d.state.sessions_corrupt_since, None);
+    }
+
+    #[test]
+    fn agents_are_not_scanned_while_rex_is_not_verified() {
+        let fx = fixture("feat/x");
+        let paths = Paths::from_home(fx.root.join("home"));
+        let runner = Routing { gh: FakeRunner::new() };
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
+        let rec = crate::state::PrRecord::fixture("o/r", 7, "feat/x", "s7");
+        agent_in(&rex, &paths, &rec.key, program_at("claude", &rec.path));
+        d.state.insert(rec);
+        d.collect_extras_with(extras_now(), &no_stop);
+        assert_eq!(d.state.get(&PrKey::new("o/r", 7)).unwrap().work_started_at, None);
+        assert!(rex.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn update_check_records_and_clears_the_new_build() {
+        let fx = fixture("feat/x");
+        let paths = Paths::from_home(fx.root.join("home"));
+        let runner = Routing { gh: FakeRunner::new() };
+        let rex = FakeMux::new();
+        let mut d = Daemon::new(paths.clone(), config(&fx, "true"), &runner, &rex, sh).unwrap();
+        let newer = "abcdef1234567890abcdef1234567890abcdef12";
+        runner.gh.on("--pattern version.txt", Output::ok(&format!("{newer}\n")));
+        d.check_update("1111111");
+        assert_eq!(d.state.update_available.as_deref(), Some(newer));
+        assert_eq!(State::read(&paths.state_file()).unwrap().update_available.as_deref(), Some(newer));
+        runner.gh.on("--pattern version.txt", Output::fail(1, "HTTP 502"));
+        d.check_update("1111111");
+        assert_eq!(d.state.update_available.as_deref(), Some(newer), "falha mantém o valor");
+        runner.gh.on("--pattern version.txt", Output::ok(&format!("{newer}\n")));
+        d.check_update(newer);
+        assert_eq!(d.state.update_available, None, "já na build nova");
+        assert!(runner.gh.lines().iter().all(|l| !l.contains("tar.gz")), "o daemon nunca baixa a build");
     }
 }

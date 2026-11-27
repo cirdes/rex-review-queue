@@ -1,20 +1,25 @@
 use crate::config::{Config, RepoConfig};
-use crate::facts::{self, divergence, Divergence};
+use crate::facts::{self, divergence, Divergence, Facts};
 use crate::git::Git;
-use crate::herdr::Herdr;
+use crate::locks;
+use crate::mux::{in_worktree, inspect_session, is_shell, Mux, MuxError};
+use crate::paths::Paths;
 use crate::reconcile::Op;
 use crate::runner::Runner;
+use crate::sessions;
 use crate::state::{Ownership, Phase, PrKey, PrRecord, Remote, State, Suppression};
 use crate::worktrees::Worktrees;
-use anyhow::{bail, Context, Result};
-use std::path::Path;
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
+use std::path::Path;
+use std::time::Duration;
 
 pub struct Ctx<'a> {
     pub cfg: &'a Config,
     pub runner: &'a dyn Runner,
-    pub herdr: &'a dyn Herdr,
     pub worktrees: &'a dyn Worktrees,
+    pub mux: &'a dyn Mux,
+    pub paths: &'a Paths,
     pub now: DateTime<Utc>,
 }
 
@@ -146,7 +151,6 @@ pub fn update(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<()> {
     }
     rec.managed_sha = Some(sha);
     rec.phase = Phase::Preparing;
-    rec.notify_pending = false;
     rec.warning = None;
     Ok(())
 }
@@ -181,7 +185,86 @@ pub fn delete_owned_branch(git: &Git, repo: &Path, rec: &PrRecord) -> Result<Opt
     Ok(None)
 }
 
-/// Remove um worktree gerenciado e impecável. Qualquer alteração local → adota.
+/// Resultado do fechamento da sessão do PR no Rex.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Closing {
+    /// A sessão estava ociosa e foi fechada; a entrada saiu do `sessions.json`.
+    Closed,
+    /// Não há sessão: sem entrada no `sessions.json`, ou a sessão já não existe no Rex (a
+    /// entrada velha é apagada).
+    NoSession,
+    /// A sessão está (ou pode estar) em uso. Nada foi fechado nem apagado.
+    InUse(String),
+}
+
+/// Fecha a sessão do PR se, e só se, ela for ociosa: em todos os blocos, o foreground é um shell
+/// com cwd dentro da worktree. Na dúvida (lock ocupado, erro do Rex, bloco sem foreground,
+/// sessão sem blocos), devolve `InUse` sem tocar em nada. Só mexe em sessões do `sessions.json`.
+pub fn close_session(ctx: &Ctx, key: &PrKey, worktree: &Path) -> Result<Closing> {
+    // arquivo corrompido devolve erro: o daemon isola o arquivo antes do próximo ciclo
+    if sessions::load(&ctx.paths.sessions_file())?.get(key).is_none() {
+        return Ok(Closing::NoSession);
+    }
+    let _lock = match locks::pr_lock(ctx.paths, key, Duration::ZERO) {
+        Ok(l) => l,
+        Err(e) if e.to_string().contains("is busy") => {
+            return Ok(Closing::InUse("the panel is entering this PR".into()))
+        }
+        Err(e) => return Err(e),
+    };
+    // relê sob o lock: o painel pode ter recriado a sessão entre a leitura e o lock
+    let Some(entry) = sessions::load(&ctx.paths.sessions_file())?.get(key).cloned() else {
+        return Ok(Closing::NoSession);
+    };
+    let blocks = match inspect_session(ctx.mux, &entry.session_id) {
+        Ok(b) => b,
+        Err(MuxError::SessionNotFound) => {
+            // fechada à mão ou numa execução que morreu antes de apagar a entrada
+            sessions::remove(ctx.paths, key)?;
+            return Ok(Closing::NoSession);
+        }
+        Err(e) => return Ok(Closing::InUse(format!("could not inspect the session: {e}"))),
+    };
+    if blocks.is_empty() {
+        return Ok(Closing::InUse("the session has no blocks to inspect".into()));
+    }
+    for (b, p) in &blocks {
+        let label = b.label.as_deref().unwrap_or(&b.id);
+        match p {
+            Some(p) if is_shell(p) && in_worktree(p, worktree) => {}
+            Some(p) if is_shell(p) => {
+                return Ok(Closing::InUse(format!("shell in block {label} is outside the worktree")))
+            }
+            Some(p) => return Ok(Closing::InUse(format!("{} running in block {label}", p.name))),
+            None => return Ok(Closing::InUse(format!("block {label} has no foreground process"))),
+        }
+    }
+    match ctx.mux.destroy_session(&entry.session_id) {
+        Ok(()) | Err(MuxError::SessionNotFound) => {}
+        Err(e) => return Err(anyhow!(e).context(format!("could not close the session of {key}"))),
+    }
+    sessions::remove(ctx.paths, key)?;
+    Ok(Closing::Closed)
+}
+
+/// Adota o worktree que divergiu durante a remoção. Devolve a nota para o log.
+fn adopt_on_removal(ctx: &Ctx, state: &mut State, key: &PrKey, reason: &str) -> Result<Option<String>> {
+    let r = record(state, key)?;
+    r.ownership = Ownership::Adopted { reason: reason.into(), at: ctx.now };
+    r.phase = Phase::Blocked { reason: format!("removal canceled: {reason}") };
+    r.clear_session_block();
+    Ok(Some(format!("removal canceled: {reason}")))
+}
+
+fn diverged(rec: &PrRecord, f: &Facts) -> Option<String> {
+    match divergence(rec, f) {
+        Some(Divergence::Diverged(reason)) => Some(reason),
+        _ => None,
+    }
+}
+
+/// Remove um worktree gerenciado e impecável. Qualquer alteração local → adota. A sessão do PR
+/// no Rex é fechada antes, só se estiver ociosa; em uso, o PR espera em `Removing`.
 pub fn remove(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<Option<String>> {
     let repo = ctx.repo(key)?;
     let git = ctx.git();
@@ -190,11 +273,22 @@ pub fn remove(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<Option<String
         return Ok(None);
     }
     let f = facts::collect(ctx.runner, &rec.path, &repo.disposable_ignored)?;
-    if let Some(Divergence::Diverged(reason)) = divergence(&rec, &f) {
-        let r = record(state, key)?;
-        r.ownership = Ownership::Adopted { reason: reason.clone(), at: ctx.now };
-        r.phase = Phase::Blocked { reason: format!("removal canceled: {reason}") };
-        return Ok(Some(format!("removal canceled: {reason}")));
+    if let Some(reason) = diverged(&rec, &f) {
+        return adopt_on_removal(ctx, state, key, &reason);
+    }
+    match close_session(ctx, key, &rec.path)? {
+        Closing::InUse(why) => {
+            let r = record(state, key)?;
+            r.leaving_blocked_by_session = true;
+            r.blocked_since.get_or_insert(ctx.now);
+            return Ok(Some(format!("session in use: {why}")));
+        }
+        Closing::Closed | Closing::NoSession => record(state, key)?.clear_session_block(),
+    }
+    // de novo: algo pode ter escrito na worktree enquanto a sessão fechava
+    let f = facts::collect(ctx.runner, &rec.path, &repo.disposable_ignored)?;
+    if let Some(reason) = diverged(&rec, &f) {
+        return adopt_on_removal(ctx, state, key, &reason);
     }
     if f.exists {
         if let Some(head) = &f.head {
@@ -206,9 +300,6 @@ pub fn remove(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<Option<String
     state.remove(key);
     if let Some(n) = &note {
         state.push_alert(format!("{key}: {n}"));
-    }
-    if ctx.cfg.notify.on_removed {
-        let _ = ctx.herdr.notify(&format!("#{} removed", key.number), &rec.title, &ctx.cfg.notify.sound);
     }
     Ok(note)
 }
@@ -260,6 +351,23 @@ pub fn release(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<String> {
         bail!("{key} cannot be released: could not read HEAD");
     }
     let stashes = git.stash_count(&repo.path)?;
+    // Mesma regra do remove: fecha a sessão só se estiver ociosa. Em uso, a sessão fica aberta
+    // e sai do sessions.json (o daemon nunca mais a fecha); a worktree é liberada mesmo assim.
+    let session_note = match close_session(ctx, key, &rec.path)? {
+        Closing::InUse(why) => {
+            sessions::remove(ctx.paths, key)?;
+            Some(format!("its Rex session was left open ({why})"))
+        }
+        Closing::Closed | Closing::NoSession => None,
+    };
+    // de novo, depois de mexer na sessão: nada local pode ter aparecido nesse meio-tempo
+    let again = facts::collect(ctx.runner, &rec.path, &repo.disposable_ignored)?;
+    if again.exists != f.exists || again.head != f.head {
+        bail!("{key} cannot be released: the worktree changed while it was being released");
+    }
+    if let Some(dirt) = again.exists.then(|| again.dirt()).flatten() {
+        bail!("{key} cannot be released: {dirt} (it appeared while the release ran)");
+    }
     if f.exists {
         if let Some(head) = &f.head {
             git.backup(&repo.path, key.number, head, ctx.now)?;
@@ -280,6 +388,9 @@ pub fn release(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<String> {
         state.push_alert(format!("{key}: {n}"));
         msg.push_str(&format!("; {n}"));
     }
+    if let Some(n) = session_note {
+        msg.push_str(&format!("; {n}"));
+    }
     if stashes > 0 {
         msg.push_str(&format!("; note: there are {stashes} stash(es) in the repository"));
     }
@@ -298,13 +409,20 @@ pub fn run_op(ctx: &Ctx, state: &mut State, op: &Op) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::FakeHerdr;
+    use crate::mux::fake::{program_at, shell_at, FakeBlock, FakeMux};
+    use crate::sessions::SessionEntry;
     use crate::worktrees::GitWorktrees;
     use crate::reconcile::worktree_path;
+    use crate::mux::MuxError;
     use crate::runner::RealRunner;
     use crate::testutil::{config, fixture, git, Fixture};
 
     const BRANCH: &str = "feat/x";
+
+    /// Rex falso e diretório de estado (sessions.json, locks) do teste.
+    fn env(fx: &Fixture) -> (FakeMux, Paths) {
+        (FakeMux::new(), Paths::from_home(fx.root.join("home")))
+    }
 
     fn creating(fx: &Fixture, cfg: &Config) -> (State, PrKey) {
         let mut rec = PrRecord::fixture("o/r", 7, BRANCH, &fx.remote_sha(BRANCH));
@@ -340,8 +458,8 @@ mod tests {
     fn create_builds_worktree_with_upstream() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         create(&ctx, &mut s, &key).unwrap();
         let rec = s.get(&key).unwrap();
@@ -376,8 +494,8 @@ mod tests {
     fn create_diffs_against_fresh_base_and_leaves_local_main_alone() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let stale = git(&fx.clone, &["rev-parse", "main"]);
         fx.author_push("main", "na-main.txt", "entrou depois\n");
         fx.author_branch("main", "feat/y", "y.txt");
@@ -395,8 +513,8 @@ mod tests {
     fn stacked_pr_diffs_against_the_pr_below_until_retargeted() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         fx.author_branch(BRANCH, "feat/y", "y.txt");
         fx.author_branch("feat/y", "feat/z", "z.txt");
         let (mut s, key) = creating_pr(&fx, &cfg, "feat/y", BRANCH);
@@ -419,8 +537,8 @@ mod tests {
     fn sync_base_keeps_a_pick_made_in_reviewr() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         fx.author_branch(BRANCH, "feat/y", "y.txt");
         let (mut s, key) = creating_pr(&fx, &cfg, "feat/y", BRANCH);
         create(&ctx, &mut s, &key).unwrap();
@@ -438,8 +556,8 @@ mod tests {
     fn create_survives_a_base_gone_from_remote() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating_pr(&fx, &cfg, BRANCH, "sumiu");
         create(&ctx, &mut s, &key).unwrap();
         let rec = s.get(&key).unwrap();
@@ -453,8 +571,8 @@ mod tests {
     fn create_waits_when_github_and_remote_disagree() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         s.get_mut(&key).unwrap().observed_head_sha = "outro-sha".into();
         create(&ctx, &mut s, &key).unwrap();
@@ -468,8 +586,8 @@ mod tests {
         let cfg = config(&fx, "true");
         git(&fx.clone, &["fetch", "-q", "origin"]);
         git(&fx.clone, &["branch", BRANCH, "origin/feat/x"]);
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         create(&ctx, &mut s, &key).unwrap();
         assert!(matches!(&s.get(&key).unwrap().phase, Phase::Blocked { reason } if reason.contains("already exists")));
@@ -480,8 +598,8 @@ mod tests {
     fn create_never_claims_an_existing_path() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let before = s.clone();
         create(&ctx, &mut s, &key).unwrap(); // simula: criou, mas o estado não foi salvo
@@ -499,8 +617,8 @@ mod tests {
     fn update_moves_to_new_sha_and_keeps_backup() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         let old = s.get(&key).unwrap().managed_sha.clone().unwrap();
@@ -519,8 +637,8 @@ mod tests {
     fn update_handles_force_push() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         let new = fx.author_force_push(BRANCH);
@@ -533,8 +651,8 @@ mod tests {
     fn update_adopts_instead_of_touching_local_commit() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&path, &["commit", "-q", "--allow-empty", "-m", "meu"]);
@@ -549,8 +667,8 @@ mod tests {
     fn update_adopts_when_user_created_a_file() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         std::fs::write(path.join("notas.txt"), "x").unwrap();
@@ -565,8 +683,8 @@ mod tests {
     fn update_with_git_lock_fails_and_retries_without_adopting() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         let new = fx.author_push(BRANCH, "f2.txt", "x");
@@ -593,8 +711,8 @@ mod tests {
     fn update_waits_when_fetch_disagrees_with_github() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         let old = git(&path, &["rev-parse", "HEAD"]);
@@ -608,8 +726,8 @@ mod tests {
     fn remove_cleans_worktree_branch_and_record() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         std::fs::create_dir_all(path.join("node_modules/pkg")).unwrap(); // descartável
@@ -626,8 +744,8 @@ mod tests {
         for (file, content) in [(".env", "SEGREDO=1"), ("feature.txt", "lockfile reescrito\n"), ("notas.txt", "x")] {
             let fx = fixture(BRANCH);
             let cfg = config(&fx, "true");
-            let herdr = FakeHerdr::new();
-            let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+            let (mux, paths) = env(&fx);
+            let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
             let (mut s, key) = creating(&fx, &cfg);
             let path = ready(&ctx, &mut s, &key);
             std::fs::write(path.join(file), content).unwrap();
@@ -644,8 +762,8 @@ mod tests {
     fn remove_preserves_branch_that_moved_after_worktree_is_gone() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&fx.clone, &["worktree", "remove", path.to_str().unwrap()]);
@@ -663,8 +781,8 @@ mod tests {
     fn remove_preserves_branch_open_in_another_worktree() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&fx.clone, &["worktree", "remove", path.to_str().unwrap()]);
@@ -680,23 +798,12 @@ mod tests {
     fn remove_of_record_without_worktree_just_forgets() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         s.get_mut(&key).unwrap().phase = Phase::Removing;
         remove(&ctx, &mut s, &key).unwrap();
         assert!(s.get(&key).is_none());
-    }
-
-    /// herdr de verdade (FakeRunner) e git de verdade.
-    struct HerdrOnFake<'a> {
-        herdr: &'a crate::runner::FakeRunner,
-    }
-
-    impl crate::runner::Runner for HerdrOnFake<'_> {
-        fn run(&self, c: &crate::runner::Cmd) -> Result<crate::runner::Output> {
-            if c.program == "herdr" { self.herdr.run(c) } else { RealRunner.run(c) }
-        }
     }
 
     /// `gh` no FakeRunner (sem regra = falha) e git de verdade.
@@ -720,36 +827,12 @@ mod tests {
     }
 
     #[test]
-    fn remove_never_reopens_a_closed_workspace() {
-        use crate::runner::{FakeRunner, Output};
-        let fx = fixture(BRANCH);
-        let cfg = config(&fx, "true");
-        let fake_herdr = FakeHerdr::new();
-        let setup_ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &fake_herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
-        let (mut s, key) = creating(&fx, &cfg);
-        let path = ready(&setup_ctx, &mut s, &key);
-        s.get_mut(&key).unwrap().phase = Phase::Removing;
-
-        let herdr_runner = FakeRunner::new();
-        let list = format!(r#"{{"result":{{"worktrees":[{{"path":"{}","open_workspace_id":null}}]}}}}"#, path.display());
-        herdr_runner.on("worktree list", Output::ok(&list));
-        let runner = HerdrOnFake { herdr: &herdr_runner };
-        let cli = crate::herdr::HerdrCli::new(&runner, None);
-        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &cli, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
-        assert_eq!(remove(&ctx, &mut s, &key).unwrap(), None);
-        assert!(!path.exists());
-        assert!(s.get(&key).is_none());
-        let lines = herdr_runner.lines();
-        assert!(lines.iter().all(|l| !l.contains("worktree open") && !l.contains("worktree remove")), "{lines:?}");
-    }
-
-    #[test]
     fn release_refuses_unpushed_commit_then_accepts_after_push() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
+        let (mux, paths) = env(&fx);
         let runner = GhOnFake::new();
-        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &runner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&path, &["checkout", "-q", "-b", "stack/minha"]);
@@ -773,8 +856,8 @@ mod tests {
     fn release_after_squash_merge_uses_pull_head() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         let head = fx.remote_sha(BRANCH);
@@ -791,9 +874,9 @@ mod tests {
     fn release_without_pull_head_stays_conservative() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
+        let (mux, paths) = env(&fx);
         let runner = GhOnFake::new();
-        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &runner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&fx.remote, &["update-ref", "-d", "refs/heads/feat/x"]);
@@ -807,9 +890,9 @@ mod tests {
     fn release_ignores_stale_refs_of_other_remotes() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
+        let (mux, paths) = env(&fx);
         let runner = GhOnFake::new();
-        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &runner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&path, &["checkout", "-q", "-b", "stack/minha"]);
@@ -826,8 +909,8 @@ mod tests {
     fn release_refuses_local_changes() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         std::fs::write(path.join("feature.txt"), "mexi\n").unwrap();
@@ -842,9 +925,9 @@ mod tests {
         for pr_state in ["MERGED", "CLOSED"] {
             let fx = fixture(BRANCH);
             let cfg = config(&fx, "true");
-            let herdr = FakeHerdr::new();
+            let (mux, paths) = env(&fx);
             let runner = GhOnFake::new();
-            let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+            let ctx = Ctx { cfg: &cfg, runner: &runner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
             let (mut s, key) = creating(&fx, &cfg);
             let path = ready(&ctx, &mut s, &key);
             git(&path, &["commit", "-q", "--allow-empty", "-m", "rebase local"]);
@@ -865,8 +948,8 @@ mod tests {
     fn release_refuses_ignored_env_file() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         std::fs::write(path.join(".env"), "SEGREDO=1").unwrap();
@@ -881,8 +964,8 @@ mod tests {
         for remote in [Remote::Pending, Remote::Unknown] {
             let fx = fixture(BRANCH);
             let cfg = config(&fx, "true");
-            let herdr = FakeHerdr::new();
-            let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+            let (mux, paths) = env(&fx);
+            let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
             let (mut s, key) = creating(&fx, &cfg);
             ready(&ctx, &mut s, &key);
             let when: DateTime<Utc> = "2026-10-07T10:00:00Z".parse().unwrap();
@@ -899,10 +982,345 @@ mod tests {
     fn release_rejects_managed() {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
-        let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
+        let (mux, paths) = env(&fx);
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &mux, paths: &paths, now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         ready(&ctx, &mut s, &key);
         assert!(release(&ctx, &mut s, &key).is_err());
+    }
+
+    // ---- fechamento da sessão do PR (item 18) ----
+
+    macro_rules! ctx {
+        ($cfg:expr, $mux:expr, $paths:expr) => {
+            Ctx { cfg: &$cfg, runner: &RealRunner, worktrees: &GitWorktrees::new(&RealRunner), mux: &$mux, paths: &$paths, now: Utc::now() }
+        };
+    }
+
+    const SID: &str = "session:pr7";
+
+    fn block(id: &str, label: &str, p: Option<crate::mux::Process>) -> FakeBlock {
+        FakeBlock { id: id.into(), label: Some(label.into()), process: p, ..Default::default() }
+    }
+
+    /// Sessão do PR no Rex falso e a entrada dela no sessions.json.
+    fn with_session(mux: &FakeMux, paths: &Paths, key: &PrKey, blocks: Vec<FakeBlock>) {
+        mux.add_session(SID, "#7 r", blocks);
+        let entry = SessionEntry { session_id: SID.into(), shell_block: "b1".into(), created_at: Utc::now(), entered_at: None };
+        sessions::upsert(paths, key, entry).unwrap();
+    }
+
+    fn has_entry(paths: &Paths, key: &PrKey) -> bool {
+        sessions::load(&paths.sessions_file()).unwrap().get(key).is_some()
+    }
+
+    fn has_session(mux: &FakeMux) -> bool {
+        mux.sessions.borrow().contains_key(SID)
+    }
+
+    fn calls(mux: &FakeMux, method: &str) -> usize {
+        mux.calls.borrow().iter().filter(|c| *c == method).count()
+    }
+
+    /// Pronto, depois a carência passou: `Removing`.
+    fn removing(ctx: &Ctx, s: &mut State, key: &PrKey) -> std::path::PathBuf {
+        let path = ready(ctx, s, key);
+        s.get_mut(key).unwrap().phase = Phase::Removing;
+        path
+    }
+
+    fn assert_waiting(s: &State, key: &PrKey) {
+        let r = s.get(key).expect("o PR continua no estado");
+        assert_eq!(r.phase, Phase::Removing);
+        assert_eq!(r.ownership, Ownership::Managed);
+        assert!(r.leaving_blocked_by_session);
+        assert!(r.blocked_since.is_some());
+    }
+
+    #[test]
+    fn idle_session_is_closed_before_the_worktree_goes() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path))), block("b2", "log", Some(shell_at(&path.join("sub"))))]);
+        assert_eq!(close_session(&ctx, &key, &path).unwrap(), Closing::Closed);
+        assert!(!has_session(&mux) && !has_entry(&paths, &key));
+
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path)))]);
+        assert_eq!(remove(&ctx, &mut s, &key).unwrap(), None);
+        assert!(!path.exists());
+        assert!(s.get(&key).is_none());
+        assert!(!has_session(&mux) && !has_entry(&paths, &key));
+        assert!(!branch_exists(&fx, BRANCH));
+    }
+
+    #[test]
+    fn dirty_worktree_is_adopted_and_its_session_kept() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path)))]);
+        std::fs::write(path.join("notas.txt"), "x").unwrap();
+        let note = remove(&ctx, &mut s, &key).unwrap().unwrap();
+        assert!(note.contains("removal canceled"), "{note}");
+        assert!(matches!(s.get(&key).unwrap().ownership, Ownership::Adopted { .. }));
+        assert!(path.join("notas.txt").exists());
+        assert!(has_session(&mux) && has_entry(&paths, &key), "a sessão não é fechada");
+        assert_eq!(calls(&mux, "destroy_session"), 0);
+    }
+
+    #[test]
+    fn changed_branch_is_preserved_with_its_session() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path)))]);
+        git(&path, &["checkout", "-q", "-b", "minha"]);
+        let note = remove(&ctx, &mut s, &key).unwrap().unwrap();
+        assert!(note.contains("switched to minha"), "{note}");
+        assert!(path.exists());
+        assert!(branch_exists(&fx, BRANCH) && branch_exists(&fx, "minha"));
+        assert!(has_session(&mux) && has_entry(&paths, &key));
+        assert_eq!(calls(&mux, "destroy_session"), 0);
+    }
+
+    #[test]
+    fn claude_in_foreground_keeps_everything_until_it_exits() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path))), block("b2", "claude", Some(program_at("claude", &path)))]);
+        let note = remove(&ctx, &mut s, &key).unwrap().unwrap();
+        assert!(note.contains("session in use") && note.contains("claude"), "{note}");
+        assert_waiting(&s, &key);
+        let since = s.get(&key).unwrap().blocked_since;
+        assert!(path.exists() && branch_exists(&fx, BRANCH));
+        assert!(has_session(&mux) && has_entry(&paths, &key));
+        assert_eq!(calls(&mux, "destroy_session"), 0);
+
+        // ciclo seguinte, ainda em uso: o tempo retido não reinicia
+        let mut later = ctx!(cfg, mux, paths);
+        later.now = Utc::now() + chrono::Duration::minutes(5);
+        remove(&later, &mut s, &key).unwrap();
+        assert_eq!(s.get(&key).unwrap().blocked_since, since);
+
+        // o Claude saiu: a remoção segue
+        mux.sessions.borrow_mut().get_mut(SID).unwrap().blocks[1].process = Some(shell_at(&path));
+        assert_eq!(remove(&ctx, &mut s, &key).unwrap(), None);
+        assert!(s.get(&key).is_none() && !path.exists());
+        assert!(!has_session(&mux) && !has_entry(&paths, &key));
+    }
+
+    #[test]
+    fn inspect_errors_and_odd_blocks_count_as_in_use() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let elsewhere = fx.root.join("outro");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        type Setup = Box<dyn Fn(&FakeMux, &Path)>;
+        let cases: Vec<(&str, Setup)> = vec![
+            ("Other", Box::new(|m: &FakeMux, _: &Path| m.fail_on("inspect_block", MuxError::Other("payload estranho".into())))),
+            ("Unreachable no view", Box::new(|m: &FakeMux, _: &Path| m.fail_on("view", MuxError::Unreachable("exit 4".into())))),
+            ("bloco sem foreground", Box::new(|m: &FakeMux, _: &Path| m.sessions.borrow_mut().get_mut(SID).unwrap().blocks[0].process = None)),
+        ];
+        for (name, setup) in cases {
+            let (mux, paths) = env(&fx);
+            let ctx = ctx!(cfg, mux, paths);
+            let (mut s, key) = creating(&fx, &cfg);
+            let path = removing(&ctx, &mut s, &key);
+            with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path)))]);
+            setup(&mux, &path);
+            let note = remove(&ctx, &mut s, &key).unwrap().unwrap();
+            assert!(note.contains("session in use"), "{name}: {note}");
+            assert_waiting(&s, &key);
+            assert!(path.exists(), "{name}");
+            assert!(has_entry(&paths, &key), "{name}");
+            assert_eq!(calls(&mux, "destroy_session"), 0, "{name}");
+            // limpa para o próximo caso (mesmo fixture, mesmo caminho)
+            git(&fx.clone, &["worktree", "remove", path.to_str().unwrap()]);
+            git(&fx.clone, &["branch", "-D", BRANCH]);
+        }
+        // shell parado fora da worktree também é uso
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&elsewhere)))]);
+        assert!(matches!(close_session(&ctx, &key, &path).unwrap(), Closing::InUse(w) if w.contains("outside")));
+    }
+
+    #[test]
+    fn session_gone_from_rex_lets_the_removal_go_on() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![]);
+        mux.sessions.borrow_mut().clear(); // fechada à mão
+        assert_eq!(remove(&ctx, &mut s, &key).unwrap(), None);
+        assert!(!path.exists() && s.get(&key).is_none());
+        assert!(!has_entry(&paths, &key), "a entrada velha sai do sessions.json");
+        assert_eq!(calls(&mux, "destroy_session"), 0);
+    }
+
+    #[test]
+    fn block_that_vanished_during_inspection_is_ignored() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path))), block("b2", "claude", Some(program_at("claude", &path)))]);
+        mux.fail_on_call("inspect_block", 2, MuxError::BlockNotFound);
+        assert_eq!(remove(&ctx, &mut s, &key).unwrap(), None);
+        assert!(!path.exists() && !has_session(&mux));
+    }
+
+    #[test]
+    fn busy_pr_lock_counts_as_in_use() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path)))]);
+        let held = locks::pr_lock(&paths, &key, Duration::ZERO).unwrap();
+        let note = remove(&ctx, &mut s, &key).unwrap().unwrap();
+        assert!(note.contains("panel"), "{note}");
+        assert_waiting(&s, &key);
+        assert!(path.exists() && has_session(&mux));
+        assert!(mux.calls.borrow().is_empty(), "sem o lock, nem inspeciona");
+        drop(held);
+    }
+
+    #[test]
+    fn session_with_zero_blocks_is_never_idle() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![]);
+        let note = remove(&ctx, &mut s, &key).unwrap().unwrap();
+        assert!(note.contains("no blocks"), "{note}");
+        assert_waiting(&s, &key);
+        assert!(path.exists() && has_session(&mux) && has_entry(&paths, &key));
+    }
+
+    #[test]
+    fn ignored_file_created_while_closing_the_session_adopts() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path)))]);
+        let env_file = path.join(".env");
+        let hook_file = env_file.clone();
+        *mux.on_destroy.borrow_mut() = Some(Box::new(move || std::fs::write(&hook_file, "SEGREDO=1").unwrap()));
+        let note = remove(&ctx, &mut s, &key).unwrap().unwrap();
+        assert!(note.contains("removal canceled") && note.contains(".env"), "{note}");
+        let r = s.get(&key).unwrap();
+        assert!(matches!(r.ownership, Ownership::Adopted { .. }));
+        assert!(!r.leaving_blocked_by_session);
+        assert_eq!(std::fs::read_to_string(&env_file).unwrap(), "SEGREDO=1");
+        assert!(branch_exists(&fx, BRANCH));
+    }
+
+    #[test]
+    fn removal_resumes_after_dying_between_destroy_and_remove() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        // morreu depois do destroy: sessão fechada, entrada e worktree ainda lá
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path)))]);
+        let before = s.clone();
+        mux.destroy_session(SID).unwrap();
+        let mut resumed = before.clone();
+        assert_eq!(remove(&ctx, &mut resumed, &key).unwrap(), None);
+        assert!(resumed.get(&key).is_none() && !path.exists() && !has_entry(&paths, &key));
+        assert!(!branch_exists(&fx, BRANCH));
+
+        // morreu depois do descarte: a worktree também já sumiu, o estado ainda diz Removing
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path)))]);
+        mux.destroy_session(SID).unwrap();
+        git(&fx.clone, &["worktree", "remove", path.to_str().unwrap()]);
+        assert_eq!(remove(&ctx, &mut s, &key).unwrap(), None);
+        assert!(s.get(&key).is_none() && !has_entry(&paths, &key));
+        assert!(!branch_exists(&fx, BRANCH));
+    }
+
+    #[test]
+    fn release_with_session_in_use_frees_the_worktree_and_keeps_the_session() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = ready(&ctx, &mut s, &key);
+        adopt(&mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "claude", Some(program_at("claude", &path)))]);
+        let msg = release(&ctx, &mut s, &key).unwrap();
+        assert!(msg.contains("released") && msg.contains("left open"), "{msg}");
+        assert!(!path.exists() && s.get(&key).is_none());
+        assert!(has_session(&mux), "a sessão em uso continua aberta");
+        assert!(!has_entry(&paths, &key), "e sai do sessions.json");
+        assert_eq!(calls(&mux, "destroy_session"), 0);
+
+        // ociosa: o release fecha a sessão
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = ready(&ctx, &mut s, &key);
+        adopt(&mut s, &key);
+        with_session(&mux, &paths, &key, vec![block("b1", "shell", Some(shell_at(&path)))]);
+        let msg = release(&ctx, &mut s, &key).unwrap();
+        assert!(!msg.contains("left open"), "{msg}");
+        assert!(!has_session(&mux) && !has_entry(&paths, &key));
+    }
+
+    #[test]
+    fn session_outside_sessions_json_is_never_closed() {
+        let fx = fixture(BRANCH);
+        let cfg = config(&fx, "true");
+        let (mux, paths) = env(&fx);
+        let ctx = ctx!(cfg, mux, paths);
+        let (mut s, key) = creating(&fx, &cfg);
+        let path = removing(&ctx, &mut s, &key);
+        // mesma cara de sessão do PR, mas não foi o rrq que a registrou
+        mux.add_session("session:manual", "#7 r", vec![block("b1", "shell", Some(shell_at(&path)))]);
+        assert_eq!(remove(&ctx, &mut s, &key).unwrap(), None);
+        assert!(!path.exists());
+        assert!(mux.sessions.borrow().contains_key("session:manual"));
+        assert!(mux.calls.borrow().is_empty(), "nem lista, nem inspeciona: {:?}", mux.calls.borrow());
     }
 }

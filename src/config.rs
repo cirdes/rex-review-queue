@@ -8,16 +8,6 @@ pub struct Config {
     #[serde(default = "default_poll_interval")]
     pub poll_interval_secs: u64,
     pub worktrees_dir: PathBuf,
-    #[serde(default)]
-    pub herdr_session: Option<String>,
-    /// Onde os worktrees viram workspaces: o herdr do terminal, o app desktop ou `auto` (padrão),
-    /// que decide pelo ambiente do painel e pelo que está de pé nesta máquina.
-    #[serde(default)]
-    pub backend: Backend,
-    /// Com `herdr-app`: a janela roda nesta máquina ou em outra que se conecta a esta. O padrão
-    /// decide pela presença do `herdr-app` aqui.
-    #[serde(default)]
-    pub window: Window,
     #[serde(default = "default_step_timeout")]
     pub step_timeout_secs: u64,
     /// Espera depois que o PR sai da lista antes de remover o worktree.
@@ -27,8 +17,6 @@ pub struct Config {
     #[serde(default = "default_reviews_today_every")]
     pub reviews_today_every_secs: u64,
     pub repos: Vec<RepoConfig>,
-    #[serde(default)]
-    pub notify: NotifyConfig,
     #[serde(default)]
     pub rex: RexConfig,
     #[serde(default)]
@@ -69,31 +57,6 @@ impl Default for ComboConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Backend {
-    /// Decide sozinho (`herdr::resolve_backend`); nunca chega resolvido a um cliente.
-    #[default]
-    Auto,
-    /// `herdr`, o multiplexador de terminal, com o painel como plugin.
-    Herdr,
-    /// O app desktop (`herdr-app`, com o herdr-core `hc`), com o painel num space.
-    HerdrApp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Window {
-    /// Remota se não houver `herdr-app` nesta máquina; local se houver.
-    #[default]
-    Auto,
-    /// O `herdr-app` está nesta máquina e o reviewq fala com ele direto.
-    Local,
-    /// A janela está em outra máquina, que conecta o herdr-core desta: o reviewq só fala com o
-    /// `hc` daqui, e o mod `reviewq-bridge` daquela janela faz o que só ela faz (focar).
-    Remote,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
@@ -102,23 +65,6 @@ pub struct RepoConfig {
     pub setup: Vec<String>,
     #[serde(default = "default_disposable")]
     pub disposable_ignored: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NotifyConfig {
-    #[serde(default = "default_true")]
-    pub on_ready: bool,
-    #[serde(default)]
-    pub on_removed: bool,
-    #[serde(default = "default_sound")]
-    pub sound: String,
-}
-
-impl Default for NotifyConfig {
-    fn default() -> Self {
-        Self { on_ready: true, on_removed: false, sound: default_sound() }
-    }
 }
 
 fn default_poll_interval() -> u64 { 60 }
@@ -131,12 +77,10 @@ fn default_reviews_today_every() -> u64 { 300 }
 pub fn grace_duration(secs: u64) -> chrono::Duration {
     chrono::Duration::seconds(secs.min(i32::MAX as u64) as i64)
 }
-fn default_true() -> bool { true }
 fn default_rex_bin() -> PathBuf { PathBuf::from("~/.local/bin/rex") }
 fn default_app_label() -> String { "macbook".into() }
 fn default_combo_claude() -> Vec<String> { vec!["claude".into()] }
 fn default_combo_reviewr() -> Vec<String> { vec!["reviewr".into(), "{worktree}".into()] }
-fn default_sound() -> String { "request".into() }
 fn default_disposable() -> Vec<String> {
     ["node_modules", "vendor/bundle", "tmp", "log", ".bundle"].iter().map(|s| s.to_string()).collect()
 }
@@ -148,8 +92,21 @@ pub fn expand_tilde(path: &Path, home: &Path) -> PathBuf {
     }
 }
 
+/// Chaves do herdr-reviewq que não existem no rrq. Têm mensagem própria, que diz o que fazer.
+const OLD_KEYS: &[&str] = &["herdr_session", "backend", "window", "notify"];
+
+fn reject_old_keys(text: &str) -> Result<()> {
+    let Ok(toml::Value::Table(t)) = text.parse::<toml::Value>() else { return Ok(()) };
+    if let Some(k) = OLD_KEYS.iter().find(|k| t.contains_key(**k)) {
+        let what = if *k == "notify" { "[notify]".to_string() } else { format!("`{k}`") };
+        bail!("config key {what} is from herdr-reviewq and no longer exists; remove it from config.toml (README, \"Migração\")");
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn parse(text: &str, home: &Path) -> Result<Config> {
+        reject_old_keys(text)?;
         let mut cfg: Config = toml::from_str(text).context("invalid config.toml")?;
         cfg.worktrees_dir = expand_tilde(&cfg.worktrees_dir, home);
         for repo in &mut cfg.repos {
@@ -192,9 +149,6 @@ impl Config {
                 bail!("invalid repo: {:?} (use owner/name)", repo.name);
             }
         }
-        if !["none", "done", "request"].contains(&self.notify.sound.as_str()) {
-            bail!("notify.sound must be none, done or request");
-        }
         if self.poll_interval_secs < 15 || self.poll_interval_secs > 3600 {
             bail!("poll_interval_secs must be between 15 and 3600");
         }
@@ -206,9 +160,6 @@ impl Config {
         }
         if self.step_timeout_secs < 1 || self.step_timeout_secs > 86400 {
             bail!("step_timeout_secs must be between 1 and 86400");
-        }
-        if self.window != Window::Auto && self.backend == Backend::Herdr {
-            bail!("window only applies with backend = \"herdr-app\" or \"auto\"");
         }
         if self.rex.app_label.trim().is_empty() {
             bail!("rex.app_label cannot be empty");
@@ -249,8 +200,6 @@ worktrees_dir = "~/Workspaces/.reviews"
 name = "acme/app"
 path = "~/Workspaces/app"
 setup = ["mise trust", "bundle install"]
-[notify]
-sound = "done"
 "#;
 
     #[test]
@@ -260,13 +209,8 @@ sound = "done"
         assert_eq!(cfg.worktrees_dir, Path::new("/Users/x/Workspaces/.reviews"));
         assert_eq!(cfg.repos[0].path, Path::new("/Users/x/Workspaces/app"));
         assert_eq!(cfg.repos[0].disposable_ignored, vec!["node_modules", "vendor/bundle", "tmp", "log", ".bundle"]);
-        assert!(cfg.notify.on_ready);
-        assert!(!cfg.notify.on_removed);
-        assert_eq!(cfg.notify.sound, "done");
         assert_eq!(cfg.step_timeout_secs, 900);
         assert_eq!(cfg.remove_grace_secs, 900);
-        assert!(cfg.herdr_session.is_none());
-        assert_eq!(cfg.backend, Backend::Auto);
         assert!(cfg.repo("acme/app").is_some());
         assert!(cfg.repo("outro/repo").is_none());
     }
@@ -307,33 +251,24 @@ sound = "done"
     }
 
     #[test]
-    fn backend_selects_the_desktop_app_and_rejects_unknown_values() {
-        let app = Config::parse(&format!("backend = \"herdr-app\"\n{FULL}"), Path::new("/h")).unwrap();
-        assert_eq!(app.backend, Backend::HerdrApp);
-        let tui = Config::parse(&format!("backend = \"herdr\"\n{FULL}"), Path::new("/h")).unwrap();
-        assert_eq!(tui.backend, Backend::Herdr);
-        let auto = Config::parse(&format!("backend = \"auto\"\n{FULL}"), Path::new("/h")).unwrap();
-        assert_eq!(auto.backend, Backend::Auto);
-        assert!(Config::parse(&format!("backend = \"tmux\"\n{FULL}"), Path::new("/h")).is_err());
-    }
-
-    #[test]
-    fn window_is_auto_by_default_and_needs_the_desktop_app_when_set() {
-        assert_eq!(Config::parse(FULL, Path::new("/h")).unwrap().window, Window::Auto);
-        let remote = Config::parse(&format!("backend = \"herdr-app\"\nwindow = \"remote\"\n{FULL}"), Path::new("/h")).unwrap();
-        assert_eq!(remote.window, Window::Remote);
-        // sem backend é `auto`, que pode virar o app: window vale
-        assert!(Config::parse(&format!("window = \"remote\"\n{FULL}"), Path::new("/h")).is_ok());
-        assert!(Config::parse(&format!("backend = \"herdr\"\nwindow = \"remote\"\n{FULL}"), Path::new("/h")).is_err());
-        assert!(Config::parse(&format!("backend = \"herdr\"\nwindow = \"local\"\n{FULL}"), Path::new("/h")).is_err());
-        assert!(Config::parse(&format!("backend = \"herdr-app\"\nwindow = \"longe\"\n{FULL}"), Path::new("/h")).is_err());
-    }
-
-    #[test]
-    fn rejects_bad_sound_and_short_poll() {
+    fn rejects_short_poll() {
         let base = "worktrees_dir = \"/w\"\n[[repos]]\nname = \"a/b\"\npath = \"/r\"\nsetup = []\n";
-        assert!(Config::parse(&format!("{base}[notify]\nsound = \"bip\"\n"), Path::new("/h")).is_err());
         assert!(Config::parse(&format!("poll_interval_secs = 5\n{base}"), Path::new("/h")).is_err());
+    }
+
+    #[test]
+    fn herdr_keys_are_rejected_by_name() {
+        let base = "worktrees_dir = \"/w\"\n[[repos]]\nname = \"a/b\"\npath = \"/r\"\nsetup = []\n";
+        for (old, shown) in [
+            ("herdr_session = \"main\"\n", "`herdr_session`"),
+            ("backend = \"herdr-app\"\n", "`backend`"),
+            ("window = \"remote\"\n", "`window`"),
+        ] {
+            let err = format!("{:#}", Config::parse(&format!("{old}{base}"), Path::new("/h")).unwrap_err());
+            assert!(err.contains(shown) && err.contains("README"), "{err}");
+        }
+        let err = format!("{:#}", Config::parse(&format!("{base}[notify]\nsound = \"done\"\n"), Path::new("/h")).unwrap_err());
+        assert!(err.contains("[notify]") && err.contains("README"), "{err}");
     }
 
     #[test]
@@ -348,7 +283,7 @@ sound = "done"
         let err = Config::parse(&format!("{base}disposable_ignore = [\"tmp\"]\n"), Path::new("/h")).unwrap_err();
         assert!(format!("{err:#}").contains("disposable_ignore"), "{err:#}");
         assert!(Config::parse(&format!("poll_interval = 30\n{base}"), Path::new("/h")).is_err());
-        assert!(Config::parse(&format!("{base}[notify]\non_redy = true\n"), Path::new("/h")).is_err());
+        assert!(Config::parse(&format!("{base}[combo]\nclaud = [\"x\"]\n"), Path::new("/h")).is_err());
     }
 
     #[test]
