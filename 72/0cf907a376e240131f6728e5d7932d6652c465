@@ -1,0 +1,23 @@
+src/herdr.rs
+  s_e016b879fcef07::t_8e9c5c731b52eb 1-4
+src/config.rs
+  s_e016b879fcef07::t_9d6905641839b1 95-106,109,254-256,260,262-271,286
+src/main.rs
+  s_e016b879fcef07::t_1c255a6b3f5a35 7,34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "720cf907a376e240131f6728e5d7932d6652c465",
+  "prompts": {},
+  "sessions": {
+    "s_e016b879fcef07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f7179532-7a96-4e96-97fe-61be0808ff9a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Cirdes <cirdes@linkana.com>"
+    }
+  }
+}
