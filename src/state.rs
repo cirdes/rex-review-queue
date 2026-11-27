@@ -108,6 +108,7 @@ pub struct PrRecord {
     pub path: PathBuf,
     #[serde(default)]
     pub created_branch: bool,
+    /// Legado do herdr-reviewq: fica no struct para o rollback, mas o rrq não grava mais.
     #[serde(default)]
     pub workspace_id: Option<String>,
     /// SHA do head do PR segundo o GitHub.
@@ -123,7 +124,8 @@ pub struct PrRecord {
     pub first_seen_at: DateTime<Utc>,
     #[serde(default)]
     pub last_request_event_at: Option<DateTime<Utc>>,
-    /// Notificação de "ready" ainda não entregue.
+    /// Legado do herdr-reviewq (notificação de "ready" ainda não entregue): fica no struct para
+    /// o rollback, mas o rrq não grava mais. O aviso de pronto é o registro 7501 do painel.
     #[serde(default)]
     pub notify_pending: bool,
     #[serde(default)]
@@ -139,6 +141,12 @@ pub struct PrRecord {
     pub work_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub work_agent: Option<String>,
+    /// Em `Removing`, a remoção esperou porque a sessão do PR no Rex está em uso.
+    #[serde(default)]
+    pub leaving_blocked_by_session: bool,
+    /// Primeira vez que a remoção esperou pela sessão (o painel mostra há quanto tempo).
+    #[serde(default)]
+    pub blocked_since: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -265,6 +273,13 @@ pub struct State {
     pub my_prs: MyPrs,
     #[serde(default)]
     pub open_prs: OpenPrs,
+    /// Desde quando o `sessions.json` corrompido foi isolado e recomeçou vazio (condição ativa do
+    /// painel). Some quando o arquivo volta a ser gravado com sucesso depois disso.
+    #[serde(default)]
+    pub sessions_corrupt_since: Option<DateTime<Utc>>,
+    /// SHA da build mais nova da `main`, quando difere da build em execução (checado 1x por dia).
+    #[serde(default)]
+    pub update_available: Option<String>,
 }
 
 fn cap<T>(v: &mut Vec<T>, max: usize) {
@@ -338,6 +353,12 @@ impl State {
 }
 
 impl PrRecord {
+    /// Esquece a espera pela sessão em uso (o PR saiu de `Removing` ou a sessão foi fechada).
+    pub fn clear_session_block(&mut self) {
+        self.leaving_blocked_by_session = false;
+        self.blocked_since = None;
+    }
+
     /// Commit contra o qual o CI é conferido. Na fila, o head que a busca de reviews viu (head novo
     /// sem CI novo vira `?`). Fora dela (Saindo/Adotado) `observed_head_sha` para de atualizar, e o
     /// CI coletado, que é sempre do head remoto atual, é o dado mais novo que existe.
@@ -378,6 +399,8 @@ impl PrRecord {
             ci: None,
             work_started_at: None,
             work_agent: None,
+            leaving_blocked_by_session: false,
+            blocked_since: None,
         }
     }
 }
@@ -385,6 +408,62 @@ impl PrRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod herdr_compat {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/compat/herdr_state.rs"));
+    }
+
+    const HERDR_STATE: &str = include_str!("../tests/fixtures/herdr_state.json");
+
+    #[test]
+    fn reads_a_state_written_by_herdr_reviewq() {
+        let s: State = serde_json::from_str(HERDR_STATE).unwrap();
+        assert_eq!(s.prs.len(), 4);
+        let ready = s.get(&PrKey::new("acme/loja", 101)).unwrap();
+        assert_eq!(ready.phase, Phase::Ready);
+        // legado: lido e mantido para o rollback
+        assert_eq!(ready.workspace_id.as_deref(), Some("w12"));
+        assert!(ready.notify_pending);
+        assert_eq!(ready.work_agent.as_deref(), Some("claude"));
+        assert!(!ready.leaving_blocked_by_session);
+        assert_eq!(ready.blocked_since, None);
+        let adopted = s.get(&PrKey::new("acme/loja", 102)).unwrap();
+        assert!(matches!(adopted.ownership, Ownership::Adopted { .. }));
+        let removing = s.get(&PrKey::new("acme/api", 7)).unwrap();
+        assert_eq!(removing.phase, Phase::Removing);
+        assert_eq!(removing.base_ref, "", "campo novo do herdr ausente vira padrão");
+        assert_eq!(s.sessions_corrupt_since, None);
+        assert_eq!(s.update_available, None);
+        // ida e volta sem perder os campos do herdr
+        let again: State = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(again, s);
+    }
+
+    #[test]
+    fn herdr_reviewq_reads_a_state_written_by_rrq() {
+        let mut s: State = serde_json::from_str(HERDR_STATE).unwrap();
+        let rec = s.get_mut(&PrKey::new("acme/api", 7)).unwrap();
+        rec.leaving_blocked_by_session = true;
+        rec.blocked_since = Some("2026-11-21T10:20:00Z".parse().unwrap());
+        s.sessions_corrupt_since = Some("2026-11-21T10:21:00Z".parse().unwrap());
+        s.update_available = Some("abc1234".into());
+        let text = serde_json::to_string_pretty(&s).unwrap();
+        let old: herdr_compat::State = serde_json::from_str(&text).unwrap();
+        assert_eq!(old.prs.len(), 4);
+        let r = &old.prs["acme/api#7"];
+        assert_eq!((r.key.repo.as_str(), r.key.number), ("acme/api", 7));
+        assert_eq!(r.phase, herdr_compat::Phase::Removing);
+        assert_eq!(r.remote, herdr_compat::Remote::NotPending);
+        assert_eq!(r.ownership, herdr_compat::Ownership::Managed);
+        assert_eq!(r.workspace_id.as_deref(), Some("w3"));
+        assert!(old.prs["acme/loja#101"].notify_pending, "legado preservado para o rollback");
+        let adopted = &old.prs["acme/loja#102"];
+        assert!(matches!(adopted.ownership, herdr_compat::Ownership::Adopted { .. }));
+        assert!(!adopted.title.is_empty() && !adopted.author.is_empty() && !adopted.url.is_empty());
+        assert!(!adopted.head_ref.is_empty() && !adopted.observed_head_sha.is_empty());
+        assert!(adopted.path.is_absolute() && adopted.first_seen_at.timestamp() > 0);
+        assert!(!old.auth_error_notified);
+    }
 
     #[test]
     fn key_roundtrip() {

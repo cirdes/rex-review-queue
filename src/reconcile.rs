@@ -47,6 +47,10 @@ pub fn reconcile(state: &State, input: &Input) -> (State, Vec<Op>) {
             RepoSnapshot::Complete(prs) => reconcile_repo(&mut s, &mut ops, repo, prs, input),
         }
     }
+    // A espera pela sessão em uso só vale em `Removing`: voltou à fila ou foi adotado, ela some.
+    for rec in s.prs.values_mut().filter(|r| r.phase != Phase::Removing) {
+        rec.clear_session_block();
+    }
     (s, ops)
 }
 
@@ -208,6 +212,8 @@ fn new_record(p: &PendingPr, input: &Input) -> PrRecord {
         ci: None,
         work_started_at: None,
         work_agent: None,
+        leaving_blocked_by_session: false,
+        blocked_since: None,
     }
 }
 
@@ -469,6 +475,48 @@ mod tests {
         assert!(ops.is_empty());
         assert_eq!(s.get(&key(1)).unwrap().phase, Phase::Preparing);
         assert_eq!(s.get(&key(1)).unwrap().generation, 1);
+    }
+
+    fn blocked_by_session(mut rec: PrRecord) -> PrRecord {
+        rec.phase = Phase::Removing;
+        rec.leaving_blocked_by_session = true;
+        rec.blocked_since = Some("2026-10-07T10:00:00Z".parse().unwrap());
+        rec
+    }
+
+    #[test]
+    fn session_block_is_cleared_when_the_pr_leaves_removing() {
+        // voltou à fila com a worktree: Removing -> Preparing
+        let rec = blocked_by_session(PrRecord::fixture(REPO, 1, "feat/x", "a1"));
+        let facts = BTreeMap::from([(key(1).to_string(), clean(&rec))]);
+        let (s, _) = run(&with(rec), &snap(vec![pr(1, "a1")]), &facts);
+        let r = s.get(&key(1)).unwrap();
+        assert_eq!(r.phase, Phase::Preparing);
+        assert!(!r.leaving_blocked_by_session);
+        assert_eq!(r.blocked_since, None);
+
+        // worktree divergiu durante a espera: adotado e bloqueado, sem o flag
+        let rec = blocked_by_session(PrRecord::fixture(REPO, 1, "feat/x", "a1"));
+        let mut f = clean(&rec);
+        f.untracked = vec!["notas.txt".into()];
+        let facts = BTreeMap::from([(key(1).to_string(), f)]);
+        let (s, _) = run(&with(rec), &snap(vec![]), &facts);
+        let r = s.get(&key(1)).unwrap();
+        assert!(matches!(r.phase, Phase::Blocked { .. }));
+        assert!(!r.leaving_blocked_by_session);
+        assert_eq!(r.blocked_since, None);
+    }
+
+    #[test]
+    fn session_block_survives_while_still_removing() {
+        let rec = blocked_by_session(PrRecord::fixture(REPO, 1, "feat/x", "a1"));
+        let since = rec.blocked_since;
+        let facts = BTreeMap::from([(key(1).to_string(), clean(&rec))]);
+        let (s, ops) = run(&with(rec), &snap(vec![]), &facts);
+        assert_eq!(ops, vec![Op::Remove(key(1))], "o executor tenta de novo a cada ciclo");
+        let r = s.get(&key(1)).unwrap();
+        assert!(r.leaving_blocked_by_session);
+        assert_eq!(r.blocked_since, since);
     }
 
     #[test]

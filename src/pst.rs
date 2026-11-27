@@ -231,6 +231,8 @@ mod tests {
             ci: None,
             work_started_at: None,
             work_agent: None,
+            leaving_blocked_by_session: false,
+            blocked_since: None,
         }
     }
 

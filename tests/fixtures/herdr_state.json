@@ -1,0 +1,141 @@
+{
+  "prs": {
+    "acme/loja#101": {
+      "key": { "repo": "acme/loja", "number": 101 },
+      "title": "Adiciona filtro por categoria",
+      "author": "joana",
+      "url": "https://github.com/acme/loja/pull/101",
+      "head_ref": "feat/filtro-categoria",
+      "base_ref": "main",
+      "synced_base": "main",
+      "remote": "pending",
+      "ownership": { "kind": "managed" },
+      "phase": { "kind": "ready" },
+      "path": "/Users/dev/reviews/acme/loja/pr-101",
+      "created_branch": true,
+      "workspace_id": "w12",
+      "observed_head_sha": "1111111111111111111111111111111111111111",
+      "managed_sha": "1111111111111111111111111111111111111111",
+      "prepared_sha": "1111111111111111111111111111111111111111",
+      "generation": 2,
+      "first_seen_at": "2026-11-20T13:00:00Z",
+      "last_request_event_at": "2026-11-20T12:59:30Z",
+      "notify_pending": true,
+      "warning": null,
+      "not_pending_since": null,
+      "ci": {
+        "sha": "1111111111111111111111111111111111111111",
+        "state": "success",
+        "failed_check": null,
+        "finished_at": "2026-11-20T13:10:00Z",
+        "observed_at": "2026-11-20T13:11:00Z"
+      },
+      "work_started_at": "2026-11-20T14:00:00Z",
+      "work_agent": "claude"
+    },
+    "acme/loja#102": {
+      "key": { "repo": "acme/loja", "number": 102 },
+      "title": "Corrige arredondamento do frete",
+      "author": "pedro",
+      "url": "https://github.com/acme/loja/pull/102",
+      "head_ref": "fix/frete",
+      "base_ref": "main",
+      "synced_base": "main",
+      "remote": "not_pending",
+      "ownership": { "kind": "adopted", "reason": "removal canceled: notas.txt", "at": "2026-11-21T09:00:00Z" },
+      "phase": { "kind": "blocked", "reason": "removal canceled: notas.txt" },
+      "path": "/Users/dev/reviews/acme/loja/pr-102",
+      "created_branch": true,
+      "workspace_id": null,
+      "observed_head_sha": "2222222222222222222222222222222222222222",
+      "managed_sha": "2222222222222222222222222222222222222222",
+      "prepared_sha": "2222222222222222222222222222222222222222",
+      "generation": 1,
+      "first_seen_at": "2026-11-19T10:00:00Z",
+      "last_request_event_at": null,
+      "notify_pending": false,
+      "warning": "author updated the PR",
+      "not_pending_since": "2026-11-21T08:40:00Z"
+    },
+    "acme/api#7": {
+      "key": { "repo": "acme/api", "number": 7 },
+      "title": "Sobe versão do driver",
+      "author": "lia",
+      "url": "https://github.com/acme/api/pull/7",
+      "head_ref": "chore/driver",
+      "remote": "not_pending",
+      "ownership": { "kind": "managed" },
+      "phase": { "kind": "removing" },
+      "path": "/Users/dev/reviews/acme/api/pr-7",
+      "created_branch": true,
+      "workspace_id": "w3",
+      "observed_head_sha": "3333333333333333333333333333333333333333",
+      "managed_sha": "3333333333333333333333333333333333333333",
+      "generation": 4,
+      "first_seen_at": "2026-11-18T10:00:00Z",
+      "not_pending_since": "2026-11-21T10:00:00Z"
+    },
+    "acme/api#8": {
+      "key": { "repo": "acme/api", "number": 8 },
+      "title": "Migração de índices",
+      "author": "lia",
+      "url": "https://github.com/acme/api/pull/8",
+      "head_ref": "feat/indices",
+      "base_ref": "main",
+      "remote": "pending",
+      "ownership": { "kind": "managed" },
+      "phase": { "kind": "failed", "step": "bundle install", "reason": "exit 1" },
+      "path": "/Users/dev/reviews/acme/api/pr-8",
+      "created_branch": true,
+      "observed_head_sha": "4444444444444444444444444444444444444444",
+      "managed_sha": "4444444444444444444444444444444444444444",
+      "first_seen_at": "2026-11-21T10:00:00Z"
+    }
+  },
+  "suppressions": { "acme/loja#90": { "after": "2026-11-15T10:00:00Z" } },
+  "repos": {
+    "acme/loja": { "ok": true, "error": null, "since": null, "forks": [55], "last_sync": "2026-11-21T10:05:00Z" },
+    "acme/api": { "ok": false, "error": "HTTP 502", "since": "2026-11-21T10:04:00Z", "forks": [], "last_sync": "2026-11-21T09:00:00Z" }
+  },
+  "last_requests": [
+    { "id": "r1", "kind": "adopt", "pr": "acme/loja#102", "ok": true, "message": "acme/loja#102 adopted", "at": "2026-11-21T09:00:00Z" }
+  ],
+  "alerts": [ { "at": "2026-11-21T09:00:00Z", "message": "acme/loja#102: branch fix/frete kept" } ],
+  "setup_process": null,
+  "auth_error_notified": false,
+  "reviews_today": {
+    "last_success": {
+      "day": "2026-11-21",
+      "count": 3,
+      "per_repo": { "acme/loja": 2, "acme/api": 1 },
+      "as_of": "2026-11-21T10:00:00Z",
+      "viewer": "dev",
+      "repos": ["acme/loja", "acme/api"]
+    },
+    "last_attempt": { "at": "2026-11-21T10:00:05Z", "ok": true, "error": null, "failed_repos": [] },
+    "backoff_until": null,
+    "failures": 0,
+    "last_day_forced": "2026-11-21"
+  },
+  "my_prs": {
+    "viewer": "dev",
+    "repos": {
+      "acme/loja": {
+        "prs": [ { "number": 120, "title": "Tela de pedidos", "url": "https://github.com/acme/loja/pull/120", "draft": false,
+                   "created_at": "2026-11-20T10:00:00Z", "head_sha": "5555555555555555555555555555555555555555", "ci": null } ],
+        "opened_24h": 1,
+        "as_of": "2026-11-21T10:00:00Z"
+      }
+    },
+    "errors": {}
+  },
+  "open_prs": {
+    "repos": {
+      "acme/loja": {
+        "prs": [ { "number": 101, "head_ref": "feat/filtro-categoria", "base_ref": "main" } ],
+        "default_branch": "main",
+        "as_of": "2026-11-21T10:00:00Z"
+      }
+    }
+  }
+}
