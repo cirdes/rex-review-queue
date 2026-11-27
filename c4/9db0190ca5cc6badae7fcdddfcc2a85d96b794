@@ -1,0 +1,23 @@
+Cargo.toml
+  s_0017d405dfa96e::t_751555e77bce2a 5
+LICENSE
+  s_0017d405dfa96e::t_7aa539b650e8ca 1-21
+src/tui/render.rs
+  s_0017d405dfa96e::t_b6c0d80e1bf45d 360,362-363,367
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c49db0190ca5cc6badae7fcdddfcc2a85d96b794",
+  "prompts": {},
+  "sessions": {
+    "s_0017d405dfa96e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "640b68cb-1d34-4715-8e32-3697eee3e2d9",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Cirdes <cirdes@linkana.com>"
+    }
+  }
+}
