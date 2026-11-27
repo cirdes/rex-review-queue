@@ -1,6 +1,7 @@
-//! Update explícito: a release rolante `main` do GitHub traz `rrq-<target>.tar.gz`, o `.sha256`
-//! ao lado e um `version.txt` com o SHA do commit. Nada é baixado sem o autor pedir; o daemon só
-//! compara o SHA uma vez por dia e grava `update_available`.
+//! Update explícito: a release rolante `main-build` do GitHub (a build mais nova da `main`, ver
+//! `.github/workflows/release.yml`) traz `rrq-<target>.tar.gz`, o `.sha256` ao lado e um
+//! `version.txt` com o SHA do commit. Nada é baixado sem o autor pedir; o daemon só compara o
+//! SHA uma vez por dia e grava `update_available`.
 
 use crate::runner::{Cmd, Runner};
 use anyhow::{bail, Context, Result};
@@ -8,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const REPO: &str = "cirdes/rex-review-queue";
-pub const RELEASE: &str = "main";
+/// Release rolante com a build mais nova da `main`. Não se chama `main` porque a tag da release
+/// teria o mesmo nome do branch, e o git passaria a achar `main` ambíguo.
+pub const RELEASE: &str = "main-build";
 
 /// SHA do commit deste binário (gravado pelo `build.rs`).
 pub fn local_sha() -> &'static str {
@@ -189,7 +192,7 @@ mod tests {
             }
             let line = c.line();
             assert!(
-                line.contains(&format!("--repo {REPO}")) && line.contains("release download main"),
+                line.contains(&format!("--repo {REPO}")) && line.contains(&format!("release download {RELEASE} ")),
                 "{line}"
             );
             self.downloads.borrow_mut().push(line.clone());
@@ -249,6 +252,22 @@ mod tests {
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
         std::fs::write(&bin, "velha").unwrap();
         bin
+    }
+
+    /// O workflow publica exatamente o que o `install` baixa.
+    #[test]
+    fn release_workflow_publishes_the_assets_install_downloads() {
+        let wf = include_str!("../.github/workflows/release.yml");
+        assert!(wf.contains(&format!("RELEASE: {RELEASE}\n")), "nome da release");
+        assert!(wf.contains("branches: [main]"));
+        for t in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+            assert!(wf.contains(t), "{t}");
+        }
+        assert!(target() == "aarch64-apple-darwin" || target() == "x86_64-apple-darwin");
+        assert!(wf.contains(r#"tar -czf "rrq-$TARGET.tar.gz" -C "target/$TARGET/release" rrq"#));
+        assert!(wf.contains(r#"shasum -a 256 "rrq-$TARGET.tar.gz" > "rrq-$TARGET.tar.gz.sha256""#));
+        assert!(wf.contains(r#"echo "$GITHUB_SHA" > version.txt"#));
+        assert!(wf.contains("--clobber") && wf.contains("--prerelease"));
     }
 
     #[test]

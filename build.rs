@@ -1,5 +1,5 @@
 //! Grava o SHA do commit do build em `RRQ_BUILD_SHA`: `GITHUB_SHA` no CI, `git rev-parse HEAD`
-//! fora dele, `unknown` sem git. O `rrq update` compara com o `version.txt` da release `main`.
+//! fora dele, `unknown` sem git. O `rrq update` compara com o `version.txt` da release `main-build`.
 
 use std::path::Path;
 use std::process::Command;

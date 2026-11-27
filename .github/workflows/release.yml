@@ -1,126 +1,94 @@
 name: release
 
-# A cada merge que muda o que vai no binário ou no plugin, sobe o patch da versão, commita na main,
-# cria a tag e publica a release com o binário de cada Mac, de onde o herdr/install.sh baixa.
-# Uma tag v* enviada à mão também publica (sem bump).
+# A cada push na main, compila o rrq para os dois Macs e substitui os assets da release rolante
+# `main-build` (prerelease): rrq-<target>.tar.gz, o .sha256 ao lado e o version.txt com o SHA do
+# commit. É daqui que o `rrq update` baixa (src/update.rs). A release não se chama `main` porque a
+# tag dela teria o mesmo nome do branch, e o git passaria a achar `main` ambíguo.
 on:
   push:
     branches: [main]
-    paths:
-      - "src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "bin/**"
-      - "herdr/**"
-      - "herdr-app/**"
-      - "herdr-plugin.toml"
-      - "config.example.toml"
-      - ".github/workflows/release.yml"
-    tags: ["v*"]
 
 permissions:
   contents: write
-  # Proveniência assinada de cada asset: `gh attestation verify <asset> --repo cirdes/herdr-reviewq`.
+  # Proveniência assinada de cada tarball: `gh attestation verify <asset> --repo cirdes/rex-review-queue`.
   id-token: write
   attestations: write
 
-# Dois merges seguidos não podem disputar o mesmo número de versão.
+# Dois pushes seguidos publicam um depois do outro: o version.txt nunca volta para uma build mais velha.
 concurrency:
   group: release
   cancel-in-progress: false
 
+env:
+  RELEASE: main-build
+
 jobs:
-  # Decide a tag. Na main: se a versão atual já tem tag, sobe o patch nos três arquivos, commita e
-  # cria a tag; se o PR já trouxe uma versão nova (minor/major à mão), só cria a tag. O push do
-  # GITHUB_TOKEN não dispara outro workflow, então o commit do bump não entra em loop.
-  version:
-    runs-on: ubuntu-latest
-    outputs:
-      tag: ${{ steps.tag.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Tag igual à versão do manifesto e do Cargo.toml
-        id: tag
-        run: |
-          read_version() { grep -m1 '^version' "$1" | sed -E 's/.*"([^"]+)".*/\1/'; }
-          manifest="$(read_version herdr-plugin.toml)"
-          cargo="$(read_version Cargo.toml)"
-          echo "manifesto=$manifest cargo=$cargo"
-          [ "$manifest" = "$cargo" ]
-
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            [ "${GITHUB_REF_NAME#v}" = "$manifest" ]
-            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          version="$manifest"
-          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-            IFS=. read -r major minor patch <<< "$version"
-            version="$major.$minor.$((patch + 1))"
-            # só a primeira linha `version` de cada arquivo (a do pacote)
-            perl -0pi -e "s/^version = \"[^\"]+\"/version = \"$version\"/m" Cargo.toml herdr-plugin.toml
-            perl -0pi -e "s/(name = \"herdr-reviewq\"\nversion = )\"[^\"]+\"/\$1\"$version\"/" Cargo.lock
-            [ "$(read_version Cargo.toml)" = "$version" ] && [ "$(read_version herdr-plugin.toml)" = "$version" ]
-            grep -A1 'name = "herdr-reviewq"' Cargo.lock | grep -q "version = \"$version\""
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -qam "chore: release v$version"
-          fi
-          git tag "v$version"
-          # Atômico: se a main andou nesse meio-tempo, nada é publicado e o próximo merge refaz.
-          git push --atomic origin "HEAD:main" "v$version"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-
-  # O install.sh baixa a release da versão do manifesto: uma tag que não bate nunca seria usada.
-  # A release nasce como rascunho, porque uma release imutável recusa assets depois de publicada.
-  create-release:
-    needs: version
-    runs-on: ubuntu-latest
-    steps:
-      - run: gh release create "$TAG" --draft --generate-notes --title "herdr-reviewq $TAG" --repo "$GITHUB_REPOSITORY"
-        env:
-          TAG: ${{ needs.version.outputs.tag }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
   binaries:
-    needs: [version, create-release]
     name: ${{ matrix.target }}
     runs-on: macos-latest
     strategy:
-      fail-fast: false
+      # Sem um dos dois Macs, nada é publicado.
+      fail-fast: true
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.version.outputs.tag }}
 
-      # Gera herdr-reviewq-<target>.tar.gz com o .sha256 ao lado: os nomes que o install.sh baixa.
-      - uses: taiki-e/upload-rust-binary-action@v1
-        id: upload
-        with:
-          bin: herdr-reviewq
-          target: ${{ matrix.target }}
-          archive: $bin-$target
-          tar: unix
-          checksum: sha256
-          ref: refs/tags/${{ needs.version.outputs.tag }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - run: rustup target add "$TARGET"
+
+      # O build.rs grava o GITHUB_SHA no binário; o `rrq update` compara com o version.txt.
+      - run: cargo build --release --locked --target "$TARGET"
+
+      # O `rrq` fica na raiz do tarball. O .sha256 tem o formato do `shasum`: "<hash>  <arquivo>".
+      - name: Empacota
+        run: |
+          tar -czf "rrq-$TARGET.tar.gz" -C "target/$TARGET/release" rrq
+          shasum -a 256 "rrq-$TARGET.tar.gz" > "rrq-$TARGET.tar.gz.sha256"
 
       - uses: actions/attest-build-provenance@v4
         with:
-          subject-path: ${{ steps.upload.outputs.tar }}
+          subject-path: rrq-${{ matrix.target }}.tar.gz
 
-  # Publica só com todos os assets anexados: um alvo que falhou deixa um rascunho, nunca um 404.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rrq-${{ matrix.target }}
+          path: |
+            rrq-${{ matrix.target }}.tar.gz
+            rrq-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
   publish:
-    needs: [version, binaries]
+    needs: binaries
     runs-on: ubuntu-latest
     steps:
-      - run: gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: rrq-*
+          merge-multiple: true
+
+      - name: Publica na release main-build
         env:
-          TAG: ${{ needs.version.outputs.tag }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            test -s "dist/rrq-$t.tar.gz"
+            test -s "dist/rrq-$t.tar.gz.sha256"
+          done
+          echo "$GITHUB_SHA" > version.txt
+
+          if ! gh release view "$RELEASE" >/dev/null 2>&1; then
+            gh release create "$RELEASE" --prerelease --target "$GITHUB_SHA" \
+              --title "rrq (build da main)" \
+              --notes "Build mais nova da main, trocada a cada push. Instale ou atualize com \`rrq update\`."
+          fi
+
+          # Tarballs primeiro e version.txt por último: quem vê o SHA novo já acha os binários dele.
+          gh release upload "$RELEASE" dist/* --clobber
+          gh release upload "$RELEASE" version.txt --clobber
+
+          # A tag acompanha o commit publicado.
+          gh api -X PATCH "repos/$GH_REPO/git/refs/tags/$RELEASE" -f sha="$GITHUB_SHA" -F force=true >/dev/null
