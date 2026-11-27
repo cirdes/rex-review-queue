@@ -343,7 +343,8 @@ impl<'a> Daemon<'a> {
                 info(&format!("{key}: setup canceled"));
             }
             info(&format!("{op:?}"));
-            let ctx = Ctx { cfg: &self.cfg, runner: self.runner, herdr: self.herdr, now: Utc::now() };
+            let worktrees = crate::worktrees::GitWorktrees::new(self.runner);
+            let ctx = Ctx { cfg: &self.cfg, runner: self.runner, herdr: self.herdr, worktrees: &worktrees, now: Utc::now() };
             match executor::run_op(&ctx, &mut self.state, &op) {
                 Ok(Some(note)) => info(&format!("{key}: {note}")),
                 Ok(None) => {}
@@ -864,7 +865,8 @@ impl<'a> Daemon<'a> {
 
     fn release(&mut self, key: &PrKey) -> Result<String> {
         self.cancel_setup_of(key);
-        let ctx = Ctx { cfg: &self.cfg, runner: self.runner, herdr: self.herdr, now: Utc::now() };
+        let worktrees = crate::worktrees::GitWorktrees::new(self.runner);
+            let ctx = Ctx { cfg: &self.cfg, runner: self.runner, herdr: self.herdr, worktrees: &worktrees, now: Utc::now() };
         executor::release(&ctx, &mut self.state, key)
     }
 

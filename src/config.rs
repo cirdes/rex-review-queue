@@ -121,7 +121,7 @@ impl Config {
         if !path.exists() {
             // Quem instalou pelo marketplace cai aqui na primeira vez que abre o painel
             bail!(
-                "missing config: copy {} to {}, edit the [[repos]] and run `herdr-reviewq service install`",
+                "missing config: copy {} to {}, edit the [[repos]] and run `rrq service install`",
                 path.with_file_name("config.example.toml").display(),
                 path.display()
             );

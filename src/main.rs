@@ -1,16 +1,16 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use herdr_reviewq::config::{grace_duration, Config, DEFAULT_REMOVE_GRACE_SECS};
-use herdr_reviewq::herdr::{self, Herdr, HerdrCli, UiRouting};
-use herdr_reviewq::paths::Paths;
-use herdr_reviewq::requests::{self, RequestKind};
-use herdr_reviewq::runner::RealRunner;
-use herdr_reviewq::state::State;
-use herdr_reviewq::{daemon, service, status, ui};
+use rrq::config::{grace_duration, Config, DEFAULT_REMOVE_GRACE_SECS};
+use rrq::herdr::{self, Herdr, HerdrCli, UiRouting};
+use rrq::paths::Paths;
+use rrq::requests::{self, RequestKind};
+use rrq::runner::RealRunner;
+use rrq::state::State;
+use rrq::{daemon, service, status, ui};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "herdr-reviewq", version, about = "Ready-to-use worktrees for the reviews requested from you")]
+#[command(name = "rrq", version, about = "Ready-to-use worktrees for the reviews requested from you, in Rex")]
 struct Cli {
     #[command(subcommand)]
     cmd: Command,
@@ -105,7 +105,7 @@ fn main() -> Result<()> {
                 Kind::ReleaseAll => RequestKind::ReleaseAll,
             };
             let id = requests::write(&paths.requests_dir(), kind, pr)?;
-            println!("request {id} sent; see the result with `herdr-reviewq status`");
+            println!("request {id} sent; see the result with `rrq status`");
             Ok(())
         }
         Command::Service { action } => match action {
@@ -113,7 +113,7 @@ fn main() -> Result<()> {
             ServiceAction::Uninstall => service::uninstall(&paths),
             ServiceAction::Restart => service::restart(),
         },
-        Command::Tui => herdr_reviewq::tui::run::run_logged(paths.clone(), || load_cfg(&paths)),
+        Command::Tui => rrq::tui::run::run_logged(paths.clone(), || load_cfg(&paths)),
         Command::Ui { action } => {
             let runner = RealRunner;
             let mut cfg = load_cfg(&paths);

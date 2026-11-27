@@ -512,7 +512,7 @@ const WATCHDOG_THREAD: &str = "tui-watchdog";
 fn report_exit(log: &Path, err: &mut dyn Write, why: &str) {
     let msg = format!("tui stopped by the watchdog: {why}");
     let _ = crate::applog::append(log, &msg);
-    let _ = writeln!(err, "herdr-reviewq: {msg}");
+    let _ = writeln!(err, "rrq: {msg}");
     let _ = err.flush();
 }
 

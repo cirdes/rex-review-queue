@@ -11,8 +11,8 @@ pub struct Paths {
 impl Paths {
     pub fn from_home(home: PathBuf) -> Self {
         Self {
-            config_file: home.join(".config/herdr-reviewq/config.toml"),
-            state_dir: home.join(".local/state/herdr-reviewq"),
+            config_file: home.join(".config/rrq/config.toml"),
+            state_dir: home.join(".local/state/rrq"),
             home,
         }
     }
@@ -34,6 +34,10 @@ impl Paths {
     }
     pub fn requests_dir(&self) -> PathBuf { self.state_dir.join("requests") }
     pub fn ui_lock_file(&self) -> PathBuf { self.state_dir.join("ui.lock") }
+    /// Mapa PR → sessão do Rex (`rrq` cria as sessões sob demanda).
+    pub fn sessions_file(&self) -> PathBuf { self.state_dir.join("sessions.json") }
+    /// Arquivos de flock (por PR, `sessions.json`, emissor do painel). Nunca são apagados.
+    pub fn locks_dir(&self) -> PathBuf { self.state_dir.join("locks") }
 }
 
 #[cfg(test)]
@@ -44,6 +48,6 @@ mod tests {
     #[test]
     fn setup_log_names_repo_and_pr() {
         let p = Paths::from_home(PathBuf::from("/h"));
-        assert_eq!(p.setup_log(&PrKey::new("o/r", 7)), PathBuf::from("/h/.local/state/herdr-reviewq/logs/o-r-pr-7.log"));
+        assert_eq!(p.setup_log(&PrKey::new("o/r", 7)), PathBuf::from("/h/.local/state/rrq/logs/o-r-pr-7.log"));
     }
 }
