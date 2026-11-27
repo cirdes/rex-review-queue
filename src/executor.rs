@@ -1,10 +1,11 @@
 use crate::config::{Config, RepoConfig};
 use crate::facts::{self, divergence, Divergence};
 use crate::git::Git;
-use crate::herdr::{CreateReq, Herdr};
+use crate::herdr::Herdr;
 use crate::reconcile::Op;
 use crate::runner::Runner;
 use crate::state::{Ownership, Phase, PrKey, PrRecord, Remote, State, Suppression};
+use crate::worktrees::Worktrees;
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 use chrono::{DateTime, Utc};
@@ -13,6 +14,7 @@ pub struct Ctx<'a> {
     pub cfg: &'a Config,
     pub runner: &'a dyn Runner,
     pub herdr: &'a dyn Herdr,
+    pub worktrees: &'a dyn Worktrees,
     pub now: DateTime<Utc>,
 }
 
@@ -54,14 +56,7 @@ pub fn create(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<()> {
     if let Some(parent) = rec.path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let created = ctx.herdr.create_worktree(&CreateReq {
-        repo: repo.path.clone(),
-        branch: rec.head_ref.clone(),
-        base: format!("origin/{}", rec.head_ref),
-        path: rec.path.clone(),
-        label: format!("#{} {}", key.number, rec.title),
-    })?;
-    rec.workspace_id = Some(created.workspace_id);
+    ctx.worktrees.create(&repo.path, &rec.head_ref, &format!("origin/{}", rec.head_ref), &rec.path)?;
     rec.created_branch = true;
     rec.managed_sha = Some(sha);
     rec.phase = Phase::Preparing;
@@ -161,11 +156,9 @@ pub(crate) fn would_overwrite(err: &str) -> bool {
     ["would be overwritten", "not uptodate", "Entry '"].iter().any(|n| err.contains(n))
 }
 
-fn discard_worktree(ctx: &Ctx, repo: &Path, path: &Path, workspace: Option<String>) -> Result<()> {
-    match workspace {
-        Some(id) => ctx.herdr.remove_worktree(&id),
-        None => ctx.git().worktree_remove(repo, path),
-    }
+/// Remove a worktree com git (sem `--force`) e faz o prune. Não passa mais pelo Herdr.
+fn discard_worktree(ctx: &Ctx, repo: &Path, path: &Path) -> Result<()> {
+    ctx.worktrees.remove(repo, path)
 }
 
 /// Apaga a branch do PR só se o daemon a criou, se ela ainda está no sha que ele
@@ -196,8 +189,6 @@ pub fn remove(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<Option<String
     if rec.ownership != Ownership::Managed {
         return Ok(None);
     }
-    // IPC antes da última checagem, para a janela entre checar e remover ser mínima.
-    let workspace = if rec.path.exists() { ctx.herdr.find_open_workspace(&repo.path, &rec.path)? } else { None };
     let f = facts::collect(ctx.runner, &rec.path, &repo.disposable_ignored)?;
     if let Some(Divergence::Diverged(reason)) = divergence(&rec, &f) {
         let r = record(state, key)?;
@@ -209,9 +200,8 @@ pub fn remove(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<Option<String
         if let Some(head) = &f.head {
             git.backup(&repo.path, key.number, head, ctx.now)?;
         }
-        discard_worktree(ctx, &repo.path, &rec.path, workspace)?;
     }
-    git.worktree_prune(&repo.path)?;
+    discard_worktree(ctx, &repo.path, &rec.path)?;
     let note = delete_owned_branch(&git, &repo.path, &rec)?;
     state.remove(key);
     if let Some(n) = &note {
@@ -231,7 +221,6 @@ pub fn release(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<String> {
     if rec.ownership == Ownership::Managed {
         bail!("{key} is not adopted; it is removed automatically when it leaves your queue");
     }
-    let workspace = if rec.path.exists() { ctx.herdr.find_open_workspace(&repo.path, &rec.path)? } else { None };
     git.fetch_origin(&repo.path).context("could not update origin to confirm that nothing is lost")?;
     // Depois de squash merge a branch some do origin; o head do PR continua em refs/pull/<n>/head.
     if let Err(e) = git.fetch_pull_head(&repo.path, key.number) {
@@ -275,9 +264,8 @@ pub fn release(ctx: &Ctx, state: &mut State, key: &PrKey) -> Result<String> {
         if let Some(head) = &f.head {
             git.backup(&repo.path, key.number, head, ctx.now)?;
         }
-        discard_worktree(ctx, &repo.path, &rec.path, workspace)?;
     }
-    git.worktree_prune(&repo.path)?;
+    discard_worktree(ctx, &repo.path, &rec.path)?;
     let note = delete_owned_branch(&git, &repo.path, &rec)?;
     if matches!(rec.remote, Remote::Pending | Remote::Unknown) {
         state.suppressions.insert(key.to_string(), Suppression { after: rec.last_request_event_at });
@@ -311,6 +299,7 @@ pub fn run_op(ctx: &Ctx, state: &mut State, op: &Op) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::herdr::FakeHerdr;
+    use crate::worktrees::GitWorktrees;
     use crate::reconcile::worktree_path;
     use crate::runner::RealRunner;
     use crate::testutil::{config, fixture, git, Fixture};
@@ -352,14 +341,14 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         create(&ctx, &mut s, &key).unwrap();
         let rec = s.get(&key).unwrap();
         assert_eq!(rec.phase, Phase::Preparing);
         assert!(rec.created_branch);
         assert_eq!(rec.managed_sha.as_deref(), Some(fx.remote_sha(BRANCH).as_str()));
-        assert_eq!(rec.workspace_id.as_deref(), Some("w1"));
+        assert_eq!(rec.workspace_id, None, "o workspace deixa de nascer junto com a worktree");
         assert_eq!(git(&rec.path, &["rev-parse", "--abbrev-ref", "@{u}"]), "origin/feat/x");
         assert_eq!(git(&rec.path, &["rev-parse", "--abbrev-ref", "HEAD"]), BRANCH);
     }
@@ -388,7 +377,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let stale = git(&fx.clone, &["rev-parse", "main"]);
         fx.author_push("main", "na-main.txt", "entrou depois\n");
         fx.author_branch("main", "feat/y", "y.txt");
@@ -407,7 +396,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         fx.author_branch(BRANCH, "feat/y", "y.txt");
         fx.author_branch("feat/y", "feat/z", "z.txt");
         let (mut s, key) = creating_pr(&fx, &cfg, "feat/y", BRANCH);
@@ -431,7 +420,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         fx.author_branch(BRANCH, "feat/y", "y.txt");
         let (mut s, key) = creating_pr(&fx, &cfg, "feat/y", BRANCH);
         create(&ctx, &mut s, &key).unwrap();
@@ -450,7 +439,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating_pr(&fx, &cfg, BRANCH, "sumiu");
         create(&ctx, &mut s, &key).unwrap();
         let rec = s.get(&key).unwrap();
@@ -465,7 +454,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         s.get_mut(&key).unwrap().observed_head_sha = "outro-sha".into();
         create(&ctx, &mut s, &key).unwrap();
@@ -480,7 +469,7 @@ mod tests {
         git(&fx.clone, &["fetch", "-q", "origin"]);
         git(&fx.clone, &["branch", BRANCH, "origin/feat/x"]);
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         create(&ctx, &mut s, &key).unwrap();
         assert!(matches!(&s.get(&key).unwrap().phase, Phase::Blocked { reason } if reason.contains("already exists")));
@@ -492,7 +481,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let before = s.clone();
         create(&ctx, &mut s, &key).unwrap(); // simula: criou, mas o estado não foi salvo
@@ -511,7 +500,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         let old = s.get(&key).unwrap().managed_sha.clone().unwrap();
@@ -531,7 +520,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         let new = fx.author_force_push(BRANCH);
@@ -545,7 +534,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&path, &["commit", "-q", "--allow-empty", "-m", "meu"]);
@@ -561,7 +550,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         std::fs::write(path.join("notas.txt"), "x").unwrap();
@@ -577,7 +566,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         let new = fx.author_push(BRANCH, "f2.txt", "x");
@@ -605,7 +594,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         let old = git(&path, &["rev-parse", "HEAD"]);
@@ -620,7 +609,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         std::fs::create_dir_all(path.join("node_modules/pkg")).unwrap(); // descartável
@@ -638,7 +627,7 @@ mod tests {
             let fx = fixture(BRANCH);
             let cfg = config(&fx, "true");
             let herdr = FakeHerdr::new();
-            let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+            let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
             let (mut s, key) = creating(&fx, &cfg);
             let path = ready(&ctx, &mut s, &key);
             std::fs::write(path.join(file), content).unwrap();
@@ -656,7 +645,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&fx.clone, &["worktree", "remove", path.to_str().unwrap()]);
@@ -675,7 +664,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&fx.clone, &["worktree", "remove", path.to_str().unwrap()]);
@@ -692,7 +681,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         s.get_mut(&key).unwrap().phase = Phase::Removing;
         remove(&ctx, &mut s, &key).unwrap();
@@ -736,7 +725,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let fake_herdr = FakeHerdr::new();
-        let setup_ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &fake_herdr, now: Utc::now() };
+        let setup_ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &fake_herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&setup_ctx, &mut s, &key);
         s.get_mut(&key).unwrap().phase = Phase::Removing;
@@ -746,7 +735,7 @@ mod tests {
         herdr_runner.on("worktree list", Output::ok(&list));
         let runner = HerdrOnFake { herdr: &herdr_runner };
         let cli = crate::herdr::HerdrCli::new(&runner, None);
-        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &cli, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &cli, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         assert_eq!(remove(&ctx, &mut s, &key).unwrap(), None);
         assert!(!path.exists());
         assert!(s.get(&key).is_none());
@@ -760,7 +749,7 @@ mod tests {
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
         let runner = GhOnFake::new();
-        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&path, &["checkout", "-q", "-b", "stack/minha"]);
@@ -785,7 +774,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         let head = fx.remote_sha(BRANCH);
@@ -804,7 +793,7 @@ mod tests {
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
         let runner = GhOnFake::new();
-        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&fx.remote, &["update-ref", "-d", "refs/heads/feat/x"]);
@@ -820,7 +809,7 @@ mod tests {
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
         let runner = GhOnFake::new();
-        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         git(&path, &["checkout", "-q", "-b", "stack/minha"]);
@@ -838,7 +827,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         std::fs::write(path.join("feature.txt"), "mexi\n").unwrap();
@@ -855,7 +844,7 @@ mod tests {
             let cfg = config(&fx, "true");
             let herdr = FakeHerdr::new();
             let runner = GhOnFake::new();
-            let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, now: Utc::now() };
+            let ctx = Ctx { cfg: &cfg, runner: &runner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
             let (mut s, key) = creating(&fx, &cfg);
             let path = ready(&ctx, &mut s, &key);
             git(&path, &["commit", "-q", "--allow-empty", "-m", "rebase local"]);
@@ -877,7 +866,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         let path = ready(&ctx, &mut s, &key);
         std::fs::write(path.join(".env"), "SEGREDO=1").unwrap();
@@ -893,7 +882,7 @@ mod tests {
             let fx = fixture(BRANCH);
             let cfg = config(&fx, "true");
             let herdr = FakeHerdr::new();
-            let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+            let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
             let (mut s, key) = creating(&fx, &cfg);
             ready(&ctx, &mut s, &key);
             let when: DateTime<Utc> = "2026-10-07T10:00:00Z".parse().unwrap();
@@ -911,7 +900,7 @@ mod tests {
         let fx = fixture(BRANCH);
         let cfg = config(&fx, "true");
         let herdr = FakeHerdr::new();
-        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, now: Utc::now() };
+        let ctx = Ctx { cfg: &cfg, runner: &RealRunner, herdr: &herdr, worktrees: &GitWorktrees::new(&RealRunner), now: Utc::now() };
         let (mut s, key) = creating(&fx, &cfg);
         ready(&ctx, &mut s, &key);
         assert!(release(&ctx, &mut s, &key).is_err());

@@ -1,8 +1,5 @@
 poll_interval_secs = 60
 worktrees_dir      = "~/Workspaces/.reviews"
-# herdr_session    = "default"   # herdr session used by the daemon (optional)
-# backend          = "herdr-app" # "herdr" (terminal) or "herdr-app" (desktop); default "auto": the panel looks at its own environment, the daemon at what is running when it starts
-# window           = "remote"    # with herdr-app or auto: "local" or "remote" (window on another machine, with the reviewq-bridge mod); default "auto": remote when there is no herdr-app here
 step_timeout_secs  = 900
 # wait after the PR leaves your queue (e.g. you approved it) before removing the worktree
 remove_grace_secs  = 900
@@ -17,7 +14,10 @@ setup = ["mise trust", "mise install", "bundle install", "pnpm install"]
 # (relative to the worktree root, as git lists them)
 disposable_ignored = ["node_modules", "vendor/bundle", "tmp", "log", ".bundle"]
 
-[notify]
-on_ready   = true
-on_removed = false
-sound      = "request"   # none | done | request
+# [rex]                                  # how rrq reaches the Rex server (coming in phase 5)
+# bin       = "~/.local/bin/rex"
+# app_label = "macbook"                 # label of the Rex app that Enter switches
+
+# [combo]                                # what `c` opens next to the PR shell; {worktree} is replaced
+# claude  = ["claude"]
+# reviewr = ["reviewr", "{worktree}"]
