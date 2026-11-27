@@ -6,6 +6,7 @@ use crate::state::{PrKey, State};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const KNOWN: &[&str] = &["claude", "codex"];
 
@@ -28,10 +29,14 @@ pub fn agent_name(p: &Process) -> Option<&'static str> {
 
 /// Agentes em foreground nas sessões dos PRs ainda sem início. Só os PRs com sessão em
 /// `sessions.json` são inspecionados; um erro numa sessão (fechada, Rex fora) só pula aquela.
-pub fn scan(mux: &dyn Mux, sessions: &Sessions, state: &State) -> Vec<AgentInfo> {
+/// Passado o `deadline` (o que sobrou do orçamento dos extras), não inspeciona mais nenhuma.
+pub fn scan(mux: &dyn Mux, sessions: &Sessions, state: &State, deadline: Instant) -> Vec<AgentInfo> {
     let mut out = vec![];
     for rec in state.prs.values().filter(|r| r.work_started_at.is_none()) {
         let Some(entry) = sessions.get(&rec.key) else { continue };
+        if Instant::now() >= deadline {
+            break;
+        }
         let Ok(blocks) = inspect_session(mux, &entry.session_id) else { continue };
         for p in blocks.into_iter().filter_map(|(_, p)| p) {
             if let Some(agent) = agent_name(&p).filter(|_| in_worktree(&p, &rec.path)) {
@@ -259,7 +264,7 @@ mod tests {
         m.add_session("s3", "#3 r", vec![fake_block("b4", program_at("codex", &w3))]);
         // PR 4 sem sessão no mapa: nem é inspecionado
         let sessions = sessions_for(&[(1, "s1"), (2, "s2"), (3, "s3")]);
-        let found = scan(&m, &sessions, &s);
+        let found = scan(&m, &sessions, &s, far());
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].agent, "claude");
         assert_eq!(found[0].cwd.as_deref(), Some(w1.join("src").as_path()));
@@ -275,10 +280,24 @@ mod tests {
         let mut s = state(&[(1, "/w/pr-1")]);
         let m = FakeMux::new();
         let sessions = sessions_for(&[(1, "sumiu")]);
-        assert!(scan(&m, &sessions, &s).is_empty());
+        assert!(scan(&m, &sessions, &s, far()).is_empty());
         m.add_session("sumiu", "#1 r", vec![fake_block("b", program_at("claude", std::path::Path::new("/w/pr-1")))]);
         m.fail_on("inspect_block", MuxError::Unreachable("x".into()));
-        assert!(scan(&m, &sessions, &s).is_empty());
+        assert!(scan(&m, &sessions, &s, far()).is_empty());
         assert!(apply_agents(&mut s, &[], now()).is_empty());
+    }
+
+    fn far() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    #[test]
+    fn scan_stops_when_the_budget_is_over() {
+        let s = state(&[(1, "/w/pr-1")]);
+        let m = FakeMux::new();
+        m.add_session("s1", "#1 r", vec![fake_block("b", program_at("claude", std::path::Path::new("/w/pr-1")))]);
+        let sessions = sessions_for(&[(1, "s1")]);
+        assert!(scan(&m, &sessions, &s, std::time::Instant::now()).is_empty());
+        assert!(m.calls.borrow().is_empty(), "sem orçamento, nem inspeciona");
     }
 }
