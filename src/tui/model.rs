@@ -57,8 +57,10 @@ pub struct Eligibility {
     pub retry: bool,
     pub adopt: bool,
     pub release: bool,
-    /// Focar o workspace do worktree.
+    /// Enter: trocar o app do Rex para a sessão da worktree.
     pub focus: bool,
+    /// `c`: o Enter mais o Claude e o reviewr.
+    pub combo: bool,
     pub log: bool,
 }
 
@@ -111,6 +113,8 @@ pub struct View {
     pub filtered: Option<(usize, usize)>,
     /// Adopted review PRs, counted before the filter: what `X` (release all) would release.
     pub adopted: usize,
+    /// Avisos do próprio painel que não são erro (ex.: outro painel emite os avisos do Rex).
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -254,6 +258,7 @@ impl View {
             empty_reason,
             filtered,
             adopted: state.prs.values().filter(|r| r.ownership != Ownership::Managed).count(),
+            notes: vec![],
         }
     }
 }
@@ -427,7 +432,8 @@ fn row_of(r: &PrRecord, section: Section, stack: String, state: &State, cfg: &Vi
             retry: managed && (matches!(r.phase, Phase::Failed { .. }) || (matches!(r.phase, Phase::Blocked { .. }) && missing)),
             adopt: managed,
             release: !managed,
-            focus: !matches!(r.phase, Phase::Removing | Phase::Creating),
+            focus: crate::focus::phase_eligible(&r.phase) && !missing,
+            combo: crate::focus::phase_eligible(&r.phase) && !missing,
             log: true,
         },
     }
@@ -637,7 +643,13 @@ mod tests {
         assert!(!e(1).retry && e(1).adopt && !e(1).release && e(1).focus && e(1).log);
         assert!(e(2).retry);
         assert!(!e(5).adopt && e(5).release && !e(5).retry);
-        assert!(!e(3).focus);
+        assert!(!e(3).focus && !e(3).combo);
+        assert!(e(1).combo && e(2).combo && e(5).combo, "Failed e adotado abrem");
+        // worktree sumida: nem Enter nem combo (mesma regra do focus::eligible)
+        let facts = UiFacts { missing_worktrees: [PrKey::new("o/r", 1)].into() };
+        let v = View::build(Some(&s), &UiState::default(), &cfg(), &facts, now);
+        let e1 = v.row(&rid(1)).unwrap().eligible;
+        assert!(!e1.focus && !e1.combo);
     }
 
     #[test]

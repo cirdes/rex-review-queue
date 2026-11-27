@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::git::Git;
 use crate::herdr::{CreateReq, Herdr};
-use crate::state::{Ownership, Phase, PrKey, Remote, State};
+pub use crate::focus::{is_first_ready_candidate, pick_first_ready};
+use crate::state::{Phase, PrKey, State};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use std::path::{Path, PathBuf};
@@ -132,19 +133,6 @@ fn give_focus_back(herdr: &dyn Herdr, panel: &str, previous: Option<&str>, deadl
 pub fn open(herdr: &dyn Herdr, lock_path: &Path, home: &Path, deadline: Instant, lock_wait: Duration) -> Result<()> {
     let (ws, _) = ensure_inner(herdr, lock_path, home, deadline, lock_wait, false)?;
     herdr.focus_workspace(&ws, deadline)
-}
-
-fn is_first_ready_candidate(r: &crate::state::PrRecord) -> bool {
-    r.remote == Remote::Pending && r.ownership == Ownership::Managed && r.phase == Phase::Ready
-}
-
-pub fn pick_first_ready(state: &State) -> Option<PrKey> {
-    state
-        .prs
-        .values()
-        .filter(|r| is_first_ready_candidate(r))
-        .min_by(|a, b| (a.first_seen_at, &a.key).cmp(&(b.first_seen_at, &b.key)))
-        .map(|r| r.key.clone())
 }
 
 /// `focus first-ready`: escolhe no estado lido e, logo antes de focar, relê o estado e confere

@@ -252,6 +252,20 @@ impl Mux for RexCli<'_> {
         parse_view(&self.api("session.view", json!({ "session_id": session }))?)
     }
 
+    fn session_of(&self, block: &str) -> MuxResult<String> {
+        let v = self.exec(vec![
+            "api".into(),
+            "call".into(),
+            "-s".into(),
+            block.into(),
+            "session.view".into(),
+        ])?;
+        v.get("session_id")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| MuxError::Other("rex: session.view without session_id".into()))
+    }
+
     fn destroy_session(&self, session: &str) -> MuxResult<()> {
         self.api("session.destroy", json!({ "session_id": session }))
             .map(|_| ())
@@ -458,7 +472,13 @@ mod tests {
             err_fx("err_block_not_found.txt"),
         );
         r.on("api call session.destroy", Output::ok("{}"));
+        r.on(
+            "api call -s block:7 session.view",
+            Output::ok(&fx("session_view.json")),
+        );
         let cli = RexCli::new(&r, "/x/rex");
+        let sid = cli.session_of("block:7").unwrap();
+        assert!(sid.starts_with("session:"), "{sid}");
         assert_eq!(cli.server_api_revision().unwrap(), 24);
         assert_eq!(cli.select_session("c", "s"), Err(MuxError::ClientNotFound));
         assert_eq!(cli.inspect_block("s1", "b9"), Err(MuxError::BlockNotFound));
@@ -523,6 +543,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(is_shell(&shell), "{shell:?}");
+            assert_eq!(cli.session_of(&split).unwrap(), c.session_id);
             cli.write(&c.session_id, &c.block_id, "true\r").unwrap();
             cli.focus_block(&c.session_id, &split).unwrap();
             assert_eq!(

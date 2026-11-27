@@ -17,7 +17,12 @@ pub enum Key {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
+    /// Enter numa review: o app do Rex troca para a sessão do PR (criada se faltar).
     Focus(PrKey),
+    /// `c`: o Enter mais o Claude e o reviewr na sessão.
+    Combo(PrKey),
+    /// `f`: entra na review pronta mais antiga.
+    FirstReady,
     /// Enter num PR seu: foca o worktree da branch, criando se não houver.
     OpenMine(PrKey),
     /// Linha e a URL vista na tela (copiada na hora); o worker relê a URL do estado.
@@ -157,6 +162,10 @@ pub fn handle(key: Key, ui: &UiState, view: &View) -> (UiState, Option<Action>) 
         }
         Key::Char('q') | Key::Esc | Key::CtrlC => (next, Some(Action::Quit)),
         Key::Char('s') => (next, Some(Action::Request(RequestKind::Sync, None))),
+        Key::Char('f') => {
+            next.message = Some("opening the oldest ready review…".into());
+            (next, Some(Action::FirstReady))
+        }
         Key::Char('X') => {
             if view.adopted > 0 {
                 // a confirmação é desenhada a partir de `confirm_all` (release_all_text)
@@ -176,15 +185,19 @@ pub fn handle(key: Key, ui: &UiState, view: &View) -> (UiState, Option<Action>) 
                         return (next, Some(Action::OpenMine(row.id.key().clone())));
                     }
                     Key::Char('o') => return (next, Some(Action::OpenUrl(row.id.clone(), row.url.clone()))),
-                    Key::Char('l' | 'R' | 'a' | 'r') => next.message = Some("only for review PRs".into()),
+                    Key::Char('l' | 'R' | 'a' | 'r' | 'c') => next.message = Some("only for review PRs".into()),
                     _ => {}
                 }
                 return (next, None);
             };
             match key {
                 Key::Enter if row.eligible.focus => (next, Some(Action::Focus(key_pr.clone()))),
-                Key::Enter => {
-                    next.message = Some("this PR is being created or removed".into());
+                Key::Char('c') if row.eligible.combo => {
+                    next.message = Some(format!("opening {key_pr} with claude and reviewr…"));
+                    (next, Some(Action::Combo(key_pr.clone())))
+                }
+                Key::Enter | Key::Char('c') => {
+                    next.message = Some("this PR is being created or removed, or its worktree is gone".into());
                     (next, None)
                 }
                 Key::Char('o') => (next, Some(Action::OpenUrl(row.id.clone(), row.url.clone()))),
@@ -378,6 +391,35 @@ mod tests {
         assert!(a.is_none() && ui.confirm.is_none());
         let (ui, _) = handle(Key::Char('a'), &at(1), &v);
         assert_eq!(ui.confirm, Some((RequestKind::Adopt, PrKey::new("o/r", 1))));
+    }
+
+    #[test]
+    fn c_opens_the_combo_only_where_enter_works() {
+        let mut creating = PrRecord::fixture("o/r", 2, "x", "s");
+        creating.phase = Phase::Creating;
+        let v = view(vec![PrRecord::fixture("o/r", 1, "x", "s"), creating]);
+        let at = |n| UiState { selected: Some(RowId::Review(PrKey::new("o/r", n))), ..Default::default() };
+        let (ui, a) = handle(Key::Char('c'), &at(1), &v);
+        assert_eq!(a, Some(Action::Combo(PrKey::new("o/r", 1))));
+        assert!(ui.message.unwrap().contains("claude"));
+        let (ui, a) = handle(Key::Char('c'), &at(2), &v);
+        assert!(a.is_none() && ui.message.unwrap().contains("being created"));
+        let mine = view_with_mine(vec![], &[9]);
+        let (ui, a) = handle(Key::Char('c'), &mine_at(9), &mine);
+        assert!(a.is_none() && ui.message.unwrap().contains("only for review PRs"));
+        // na busca, `c` é letra
+        let (ui, a) = handle(Key::Char('c'), &UiState { typing: true, ..at(1) }, &v);
+        assert!(a.is_none() && ui.filter == "c");
+    }
+
+    #[test]
+    fn f_opens_the_first_ready_from_anywhere() {
+        let v = view(vec![PrRecord::fixture("o/r", 1, "x", "s")]);
+        assert_eq!(handle(Key::Char('f'), &UiState::default(), &v).1, Some(Action::FirstReady));
+        assert_eq!(handle(Key::Char('f'), &mine_at(9), &view_with_mine(vec![], &[9])).1, Some(Action::FirstReady));
+        assert_eq!(handle(Key::Char('f'), &UiState::default(), &view(vec![])).1, Some(Action::FirstReady), "sem seleção também");
+        let (ui, a) = handle(Key::Char('f'), &UiState { typing: true, ..Default::default() }, &v);
+        assert!(a.is_none() && ui.filter == "f");
     }
 
     #[test]

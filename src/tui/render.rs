@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 pub const MIN_W: u16 = 60;
 pub const MIN_H: u16 = 12;
-const FOOTER: &str = "/ search · enter open · o GitHub · l log · s sync · R retry · a adopt · r release · X release all · q quit";
+const FOOTER: &str = "/ search · enter open · c combo · f next · o GitHub · l log · s sync · R retry · a adopt · r release · X release all · q quit";
 const MAX_CONFIRM_LINES: u16 = 4;
 const BOTTOM_H: u16 = 5;
 
@@ -134,6 +134,7 @@ fn draw_bottom(f: &mut Frame, area: Rect, view: &View) {
     if let Some(e) = &view.empty_reason {
         lines.push(Line::raw(format!(" {e}")));
     }
+    lines.extend(view.notes.iter().map(|n| Line::styled(format!(" {n}"), Style::new().fg(Color::DarkGray))));
     let cap = info.height as usize;
     if lines.len() > cap {
         if cap > 1 {
