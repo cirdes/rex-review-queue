@@ -407,22 +407,39 @@ fn ensure_block(
             })?;
             Ok((id, BlockAction::Opened))
         }
-        Some((b, Some(p))) if is_shell(p) => {
-            // o programa saiu e o shell pode ter mudado de pasta
-            let line = if in_worktree(p, worktree) {
-                cmd
-            } else {
-                format!("cd {} && {cmd}", quote(&worktree.to_string_lossy()))
-            };
-            mux.write(session, &b.id, &format!("{line}\r"))?;
-            Ok((b.id.clone(), BlockAction::Relaunched))
-        }
-        Some((b, Some(_))) => Ok((b.id.clone(), BlockAction::Running)),
-        Some((b, None)) => Ok((b.id.clone(), BlockAction::NoProgram)),
+        Some((b, p)) => Ok((
+            b.id.clone(),
+            run_in(mux, session, &b.id, p.as_ref(), &cmd, worktree)?,
+        )),
     }
 }
 
-/// `c`: o Enter, depois o Claude à direita do shell e o reviewr à direita do Claude, sem duplicar.
+/// Roda `cmd` num bloco que já existe: escreve no shell parado, ou deixa o programa que roda.
+fn run_in(
+    mux: &dyn Mux,
+    session: &str,
+    block: &str,
+    p: Option<&Process>,
+    cmd: &str,
+    worktree: &Path,
+) -> FocusResult<BlockAction> {
+    match p {
+        Some(p) if is_shell(p) => {
+            // o programa saiu e o shell pode ter mudado de pasta
+            let line = if in_worktree(p, worktree) {
+                cmd.to_string()
+            } else {
+                format!("cd {} && {cmd}", quote(&worktree.to_string_lossy()))
+            };
+            mux.write(session, block, &format!("{line}\r"))?;
+            Ok(BlockAction::Relaunched)
+        }
+        Some(_) => Ok(BlockAction::Running),
+        None => Ok(BlockAction::NoProgram),
+    }
+}
+
+/// `c`: o Enter, depois o Claude no shell da sessão e o reviewr à direita dele, sem duplicar.
 /// Se falhar no meio, o próximo `c` completa o que faltou. O foco termina no Claude.
 pub fn combo(ctx: &Ctx, key: &PrKey) -> FocusResult<Combo> {
     timed(ctx, "combo", key, |ctx| {
@@ -439,16 +456,42 @@ pub fn combo(ctx: &Ctx, key: &PrKey) -> FocusResult<Combo> {
                 "the session has no blocks".into(),
             )))?;
         let combo = &ctx.cfg.combo;
-        let (claude, claude_did) = ensure_block(
-            ctx.mux,
-            &entered.session,
-            &blocks,
-            CLAUDE_LABEL,
-            &anchor,
-            CLAUDE_RATIO,
-            &combo.claude,
-            &rec.path,
-        )?;
+        // sessões antigas podem ter um bloco `claude` à parte: segue usando ele
+        let has_claude = blocks
+            .iter()
+            .any(|(b, _)| b.label.as_deref() == Some(CLAUDE_LABEL));
+        let (claude, claude_did) = if has_claude {
+            ensure_block(
+                ctx.mux,
+                &entered.session,
+                &blocks,
+                CLAUDE_LABEL,
+                &anchor,
+                CLAUDE_RATIO,
+                &combo.claude,
+                &rec.path,
+            )?
+        } else {
+            // o Claude roda no próprio shell da sessão: o combo tem dois blocos, sem terminal vazio
+            let p = blocks
+                .iter()
+                .find(|(b, _)| b.id == anchor)
+                .and_then(|(_, p)| p.as_ref());
+            let did = run_in(
+                ctx.mux,
+                &entered.session,
+                &anchor,
+                p,
+                &command_line(&combo.claude, &rec.path),
+                &rec.path,
+            )?;
+            let did = if did == BlockAction::Relaunched {
+                BlockAction::Opened
+            } else {
+                did
+            };
+            (anchor.clone(), did)
+        };
         let (_, reviewr_did) = ensure_block(
             ctx.mux,
             &entered.session,
@@ -886,12 +929,16 @@ mod tests {
         );
         let b = f.blocks();
         let labels: Vec<_> = b.iter().map(|b| b.label.clone().unwrap()).collect();
-        assert_eq!(labels, ["shell", "claude", "reviewr"]);
-        assert_eq!(b[1].written, ["claude\r"]);
-        assert_eq!(b[2].written, [format!("reviewr '{}'\r", f.wt.display())]);
-        assert_eq!(f.mux.focused.borrow().as_slice(), [b[1].id.clone()]);
+        assert_eq!(
+            labels,
+            ["shell", "reviewr"],
+            "o Claude roda no shell: sem terminal vazio"
+        );
+        assert_eq!(b[0].written, ["claude\r"]);
+        assert_eq!(b[1].written, [format!("reviewr '{}'\r", f.wt.display())]);
+        assert_eq!(f.mux.focused.borrow().as_slice(), [b[0].id.clone()]);
         let calls = f.calls();
-        assert_eq!(calls.iter().filter(|c| *c == "new_split").count(), 2);
+        assert_eq!(calls.iter().filter(|c| *c == "new_split").count(), 1);
         assert_eq!(calls.last().unwrap(), "focus_block");
     }
 
@@ -949,22 +996,14 @@ mod tests {
         };
         combo(&ctx, &key()).unwrap();
         let splits = spy.1.borrow();
-        let claude_id = f.blocks()[1].id.clone();
+        assert_eq!(splits.len(), 1);
         assert_eq!(
             (
                 splits[0].anchor.as_str(),
                 splits[0].ratio,
                 splits[0].label.as_str()
             ),
-            ("block:sh", 0.5, "claude")
-        );
-        assert_eq!(
-            (
-                splits[1].anchor.as_str(),
-                splits[1].ratio,
-                splits[1].label.as_str()
-            ),
-            (claude_id.as_str(), 0.45, "reviewr")
+            ("block:sh", 0.45, "reviewr")
         );
         assert!(splits.iter().all(|s| s.cwd == f.wt && !s.focus));
     }
@@ -975,25 +1014,25 @@ mod tests {
         f.open_session();
         combo(&f.ctx(), &key()).unwrap();
         // Claude saiu (`/exit`): o foreground voltou a ser o shell. O reviewr segue rodando.
-        f.set_process("claude", shell_at(&f.wt));
+        f.set_process("shell", shell_at(&f.wt));
         f.set_process("reviewr", program_at("reviewr", &f.wt));
         f.calls();
         let got = combo(&f.ctx(), &key()).unwrap();
         assert_eq!(
             (got.claude, got.reviewr),
-            (BlockAction::Relaunched, BlockAction::Running)
+            (BlockAction::Opened, BlockAction::Running)
         );
         let b = f.blocks();
-        assert_eq!(b.len(), 3, "não duplica");
-        assert_eq!(b[1].written, ["claude\r", "claude\r"]);
-        assert_eq!(b[2].written.len(), 1);
+        assert_eq!(b.len(), 2, "não duplica");
+        assert_eq!(b[0].written, ["claude\r", "claude\r"]);
+        assert_eq!(b[1].written.len(), 1);
         assert!(!f.calls().contains(&"new_split".to_string()));
 
         // shell parado fora da worktree: volta para ela antes de relançar
-        f.set_process("claude", shell_at(Path::new("/tmp")));
+        f.set_process("shell", shell_at(Path::new("/tmp")));
         combo(&f.ctx(), &key()).unwrap();
         assert_eq!(
-            f.blocks()[1].written.last().unwrap(),
+            f.blocks()[0].written.last().unwrap(),
             &format!("cd '{}' && claude\r", f.wt.display())
         );
     }
@@ -1003,7 +1042,7 @@ mod tests {
         let f = fx();
         f.open_session();
         combo(&f.ctx(), &key()).unwrap();
-        f.set_process("claude", program_at("2.1.332", &f.wt));
+        f.set_process("shell", program_at("2.1.332", &f.wt));
         f.set_process("reviewr", program_at("reviewr", &f.wt));
         f.calls();
         let got = combo(&f.ctx(), &key()).unwrap();
@@ -1016,7 +1055,7 @@ mod tests {
             !calls.iter().any(|c| c == "new_split" || c == "write"),
             "{calls:?}"
         );
-        assert_eq!(f.blocks().len(), 3);
+        assert_eq!(f.blocks().len(), 2);
     }
 
     #[test]
@@ -1024,10 +1063,10 @@ mod tests {
         let f = fx();
         f.open_session();
         f.mux
-            .fail_on_call("new_split", 2, MuxError::Other("timeout".into()));
+            .fail_on_call("new_split", 1, MuxError::Other("timeout".into()));
         assert!(combo(&f.ctx(), &key()).is_err());
-        assert_eq!(f.blocks().len(), 2, "só o claude abriu");
-        f.set_process("claude", program_at("claude", &f.wt));
+        assert_eq!(f.blocks().len(), 1, "só o claude abriu, no shell");
+        f.set_process("shell", program_at("claude", &f.wt));
         let got = combo(&f.ctx(), &key()).unwrap();
         assert_eq!(
             (got.claude, got.reviewr),
@@ -1038,7 +1077,7 @@ mod tests {
             .iter()
             .map(|b| b.label.clone().unwrap())
             .collect();
-        assert_eq!(labels, ["shell", "claude", "reviewr"]);
+        assert_eq!(labels, ["shell", "reviewr"]);
     }
 
     #[test]
@@ -1046,7 +1085,7 @@ mod tests {
         let f = fx();
         let got = combo(&f.ctx(), &key()).unwrap();
         assert!(got.entered.created);
-        assert_eq!(f.blocks().len(), 3);
+        assert_eq!(f.blocks().len(), 2);
         assert_eq!(f.blocks()[0].id, f.entry().unwrap().shell_block);
     }
 
@@ -1066,7 +1105,42 @@ mod tests {
         };
         sessions::upsert(&f.paths, &key(), e).unwrap();
         combo(&f.ctx(), &key()).unwrap();
-        assert_eq!(f.blocks().len(), 3);
+        let b = f.blocks();
+        assert_eq!(b.len(), 2);
+        assert_eq!(
+            b[0].written,
+            ["claude\r"],
+            "o Claude roda no bloco que sobrou"
+        );
+    }
+
+    #[test]
+    fn combo_keeps_using_a_separate_claude_block_from_older_sessions() {
+        let f = fx();
+        f.mux.add_session(
+            "session:pr",
+            "#7 r",
+            vec![
+                block("block:sh", "shell", shell_at(&f.wt)),
+                block("block:cl", "claude", program_at("claude", &f.wt)),
+            ],
+        );
+        let e = SessionEntry {
+            session_id: "session:pr".into(),
+            shell_block: "block:sh".into(),
+            created_at: Utc::now(),
+            entered_at: None,
+        };
+        sessions::upsert(&f.paths, &key(), e).unwrap();
+        let got = combo(&f.ctx(), &key()).unwrap();
+        assert_eq!(got.claude, BlockAction::Running);
+        let b = f.blocks();
+        assert!(
+            b[0].written.is_empty(),
+            "não roda um segundo Claude no shell"
+        );
+        assert_eq!(b.len(), 3);
+        assert_eq!(f.mux.focused.borrow().as_slice(), ["block:cl".to_string()]);
     }
 
     #[test]
@@ -1124,7 +1198,7 @@ mod tests {
         f.open_session();
         combo(&f.ctx(), &key()).unwrap();
         let id = f.entry().unwrap().session_id;
-        f.mux.sessions.borrow_mut().get_mut(&id).unwrap().blocks[1].process = None;
+        f.mux.sessions.borrow_mut().get_mut(&id).unwrap().blocks[0].process = None;
         f.set_process("reviewr", program_at("reviewr", &f.wt));
         let got = combo(&f.ctx(), &key()).unwrap();
         assert_eq!(
@@ -1132,7 +1206,7 @@ mod tests {
             (BlockAction::NoProgram, BlockAction::Running)
         );
         assert_eq!(
-            f.blocks()[1].written.len(),
+            f.blocks()[0].written.len(),
             1,
             "não escreve num bloco sem programa"
         );
