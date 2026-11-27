@@ -179,26 +179,8 @@ impl Drop for TerminalGuard {
 
 fn osc52(text: &str) {
     let mut out = std::io::stdout();
-    let _ = write!(out, "\x1b]52;c;{}\x07", base64_lite::encode(text.as_bytes()));
+    let _ = write!(out, "\x1b]52;c;{}\x07", crate::pst::base64(text.as_bytes()));
     let _ = out.flush();
-}
-
-mod base64_lite {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    pub fn encode(b: &[u8]) -> String {
-        let mut o = String::new();
-        for c in b.chunks(3) {
-            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-            for i in 0..4 {
-                if i <= c.len() {
-                    o.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
-                } else {
-                    o.push('=');
-                }
-            }
-        }
-        o
-    }
 }
 
 /// O que o worker precisa para executar uma ação.
@@ -716,10 +698,7 @@ mod tests {
 
     #[test]
     fn base64_matches_standard_encoding() {
-        assert_eq!(base64_lite::encode(b"url"), "dXJs");
-        assert_eq!(base64_lite::encode(b"ur"), "dXI=");
-        assert_eq!(base64_lite::encode(b"u"), "dQ==");
-        assert_eq!(base64_lite::encode(b""), "");
+        assert_eq!(crate::pst::base64(b"url"), "dXJs");
     }
 
     struct Fx {
