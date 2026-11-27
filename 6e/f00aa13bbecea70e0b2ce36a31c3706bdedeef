@@ -1,0 +1,55 @@
+src/rex.rs
+  s_0017d405dfa96e::t_31cee99d52f843 1-286
+  s_0017d405dfa96e::t_3fe1d2fb71fc4c 287-505
+src/mux.rs
+  s_0017d405dfa96e::t_a2a246eeecf2e3 1-316
+  s_0017d405dfa96e::t_2b43e835e74dc2 317-412
+src/lib.rs
+  s_0017d405dfa96e::t_74508fced04b92 9,16
+tests/fixtures/rex/block_process_running.json
+  s_0017d405dfa96e::t_50e700199aff8a 1
+tests/fixtures/rex/block_process_shell.json
+  s_0017d405dfa96e::t_fe69c0ba2ab263 1
+tests/fixtures/rex/block_write.json
+  s_0017d405dfa96e::t_03d00b4e6ca50e 1
+tests/fixtures/rex/client_list.json
+  s_0017d405dfa96e::t_fc0e627b411c54 1
+tests/fixtures/rex/err_block_not_found.txt
+  s_0017d405dfa96e::t_f2a72d933a3592 1-2
+tests/fixtures/rex/err_client_not_found.txt
+  s_0017d405dfa96e::t_1e8a670c9952f1 1-2
+tests/fixtures/rex/err_select_missing_session.txt
+  s_0017d405dfa96e::t_e61d8e7875bd5e 1-2
+tests/fixtures/rex/err_unreachable.txt
+  s_0017d405dfa96e::t_b19e9bb7efd380 1-2
+tests/fixtures/rex/err_view_session_not_found.txt
+  s_0017d405dfa96e::t_c0430707da3b6d 1-2
+tests/fixtures/rex/new_split.json
+  s_0017d405dfa96e::t_70660287a841a9 1
+tests/fixtures/rex/perform_ok.json
+  s_0017d405dfa96e::t_3a5213f941162a 1
+tests/fixtures/rex/server_version.json
+  s_0017d405dfa96e::t_f9dcf21b5c9745 1
+tests/fixtures/rex/session_create.json
+  s_0017d405dfa96e::t_0fc0654683a19f 1
+tests/fixtures/rex/session_list.json
+  s_0017d405dfa96e::t_d35e7ba1e401cc 1
+tests/fixtures/rex/session_view.json
+  s_0017d405dfa96e::t_764913912d10ff 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6ef00aa13bbecea70e0b2ce36a31c3706bdedeef",
+  "prompts": {},
+  "sessions": {
+    "s_0017d405dfa96e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "640b68cb-1d34-4715-8e32-3697eee3e2d9",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Cirdes <cirdes@linkana.com>"
+    }
+  }
+}
