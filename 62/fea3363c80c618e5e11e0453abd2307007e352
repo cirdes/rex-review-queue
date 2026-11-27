@@ -1,0 +1,33 @@
+tests/compat/herdr_state.rs
+  s_e016b879fcef07::t_2bcfeaded1155b 1-3
+  s_e016b879fcef07::t_2834fcf82b7305 4-67
+src/state.rs
+  s_e016b879fcef07::t_08f12b289d4e72 111,127-128,144-149,276-282,356-361,402-403
+  s_e016b879fcef07::t_2834fcf82b7305 415-458,460-467
+  s_e016b879fcef07::t_2bcfeaded1155b 412-414
+  s_e016b879fcef07::t_89bfa483f58137 459
+src/reconcile.rs
+  s_e016b879fcef07::t_08f12b289d4e72 215-216
+  s_e016b879fcef07::t_ea90153cd13b38 480-521
+  s_e016b879fcef07::t_2c3276350faea4 50-53
+src/pst.rs
+  s_e016b879fcef07::t_2c3276350faea4 234-235
+tests/fixtures/herdr_state.json
+  s_e016b879fcef07::t_66d3926a1f5db2 1-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "62fea3363c80c618e5e11e0453abd2307007e352",
+  "prompts": {},
+  "sessions": {
+    "s_e016b879fcef07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f7179532-7a96-4e96-97fe-61be0808ff9a",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Cirdes <cirdes@linkana.com>"
+    }
+  }
+}
