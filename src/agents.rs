@@ -4,13 +4,13 @@ use crate::mux::{inspect_session, in_worktree, Mux, Process};
 use crate::sessions::Sessions;
 use crate::state::{PrKey, State};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const KNOWN: &[&str] = &["claude", "codex"];
 
-/// Agente visto numa worktree: pelo Rex (`scan`) ou, no legado, pelo `herdr agent list`.
+/// Agente visto numa worktree pelo `scan`. `foreground_cwd` é um segundo caminho opcional que
+/// também conta para achar a worktree.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentInfo {
     pub agent: String,
@@ -47,26 +47,6 @@ pub fn scan(mux: &dyn Mux, sessions: &Sessions, state: &State, deadline: Instant
     out
 }
 
-fn abs(v: &Value, k: &str) -> Option<PathBuf> {
-    let p = PathBuf::from(v.get(k)?.as_str()?);
-    p.is_absolute().then_some(p)
-}
-
-/// `result` do `herdr agent list`. Entradas sem nome ou sem nenhum caminho absoluto são ignoradas.
-pub fn parse_agents(result: &Value) -> Vec<AgentInfo> {
-    result
-        .get("agents")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|a| {
-            let agent = a.get("agent")?.as_str()?.to_string();
-            let (cwd, foreground_cwd) = (abs(a, "cwd"), abs(a, "foreground_cwd"));
-            (cwd.is_some() || foreground_cwd.is_some()).then_some(AgentInfo { agent, cwd, foreground_cwd })
-        })
-        .collect()
-}
-
 fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
@@ -101,7 +81,6 @@ mod tests {
     use crate::sessions::SessionEntry;
     use crate::state::{PrKey, PrRecord, State};
     use chrono::{DateTime, Utc};
-    use serde_json::json;
     use std::path::PathBuf;
 
     fn now() -> DateTime<Utc> {
@@ -125,31 +104,6 @@ mod tests {
     fn started(s: &State, n: u64) -> (Option<DateTime<Utc>>, Option<String>) {
         let r = s.get(&PrKey::new("o/r", n)).unwrap();
         (r.work_started_at, r.work_agent.clone())
-    }
-
-    #[test]
-    fn parses_real_agent_list() {
-        let result = json!({"agents": [
-            {"agent": "claude", "agent_status": "done", "cwd": "/w/pr-15791", "foreground_cwd": "/w/pr-15791/src",
-             "pane_id": "w26:p1", "workspace_id": "w26"},
-            {"agent": "codex", "agent_status": "working", "foreground_cwd": "/w/pr-2"},
-            {"agent": "claude", "agent_status": "idle"},
-            {"agent": "claude", "cwd": "relativo/pr-3"},
-            {"cwd": "/w/pr-4"}
-        ], "type": "agent_list"});
-        let agents = parse_agents(&result);
-        assert_eq!(
-            agents,
-            vec![
-                AgentInfo {
-                    agent: "claude".into(),
-                    cwd: Some("/w/pr-15791".into()),
-                    foreground_cwd: Some("/w/pr-15791/src".into())
-                },
-                AgentInfo { agent: "codex".into(), cwd: None, foreground_cwd: Some("/w/pr-2".into()) },
-            ]
-        );
-        assert!(parse_agents(&json!({"nada": 1})).is_empty());
     }
 
     #[test]
