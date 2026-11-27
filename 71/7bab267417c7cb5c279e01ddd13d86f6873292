@@ -1,0 +1,21 @@
+README.md
+  s_0017d405dfa96e::t_b5d42e0e5e44ff 186
+src/focus.rs
+  s_0017d405dfa96e::t_728dbc99b6eef8 410-427,430,434-435,437-438,442,459-494,932-939,941,999,1006,1017,1023,1026-1028,1032,1035,1045,1058,1066,1068-1069,1080,1088,1108-1143,1201,1209
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "717bab267417c7cb5c279e01ddd13d86f6873292",
+  "prompts": {},
+  "sessions": {
+    "s_0017d405dfa96e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "640b68cb-1d34-4715-8e32-3697eee3e2d9",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Cirdes <cirdes@linkana.com>"
+    }
+  }
+}
