@@ -1,13 +1,18 @@
 use crate::config::Config;
-use crate::herdr::{Herdr, UiRouting};
+use crate::focus::{self, BlockAction, MineWorktree};
+use crate::mux::{Mux, SplitReq};
 use crate::paths::Paths;
+use crate::pst::{self, Record};
 use crate::requests;
-use crate::runner::{Cmd, RealRunner, Runner};
+use crate::rex::RexCli;
+use crate::runner::{RealRunner, Runner};
+use crate::sessions::{self, Sessions};
 use crate::state::{PrKey, State};
 use crate::tui::keys::{handle, Action, Key};
 use crate::tui::model::{reselect, RowId, Sent, UiFacts, UiState, View, ViewConfig};
-use crate::ui::UI_CALL_TIMEOUT;
 use anyhow::{bail, Result};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -47,6 +52,7 @@ impl std::fmt::Display for Exit {
             Exit::Signal(libc::SIGINT) => f.write_str("signal SIGINT"),
             Exit::Signal(libc::SIGTERM) => f.write_str("signal SIGTERM"),
             Exit::Signal(libc::SIGHUP) => f.write_str("signal SIGHUP"),
+            Exit::Signal(libc::SIGABRT) => f.write_str("signal SIGABRT"),
             Exit::Signal(n) => write!(f, "signal {n}"),
         }
     }
@@ -185,35 +191,95 @@ fn osc52(text: &str) {
 
 /// O que o worker precisa para executar uma ação.
 struct WorkerCtx<'a> {
-    herdr: &'a dyn Herdr,
+    mux: &'a dyn Mux,
     runner: &'a dyn Runner,
     cfg: &'a Config,
     paths: &'a Paths,
-    routing: UiRouting,
-    /// `HERDR_PANE_ID` do próprio TUI (onde abrir o split do log).
-    pane: Option<String>,
+    /// `client_id` do app do Rex, refeito quando o Rex diz que ele sumiu.
+    client: RefCell<Option<String>>,
+    /// `REX_BLOCK` do próprio TUI (âncora do split do log).
+    block: Option<String>,
+}
+
+impl WorkerCtx<'_> {
+    fn focus(&self) -> focus::Ctx<'_> {
+        focus::Ctx { mux: self.mux, cfg: self.cfg, paths: self.paths, client: &self.client }
+    }
+}
+
+/// Resultado de uma ação: a mensagem do rodapé e, depois de um Enter, o PR em que o autor entrou
+/// (o loop relê o `sessions.json` na hora, para o aviso do PR sumir sem esperar o mtime).
+#[derive(Debug, Default, PartialEq)]
+struct Done {
+    msg: String,
+    entered: Option<PrKey>,
+}
+
+impl Done {
+    fn msg(m: impl Into<String>) -> Self {
+        Done { msg: m.into(), entered: None }
+    }
+    fn entered(key: &PrKey, m: impl Into<String>) -> Self {
+        Done { msg: m.into(), entered: Some(key.clone()) }
+    }
 }
 
 /// Executa `f` e transforma um pânico em mensagem, para o worker sobreviver.
-fn guarded(f: impl FnOnce() -> String) -> String {
+fn guarded(f: impl FnOnce() -> Done) -> Done {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-        Ok(msg) => msg,
+        Ok(done) => done,
         Err(p) => {
             let why = p
                 .downcast_ref::<&str>()
                 .map(|s| s.to_string())
                 .or_else(|| p.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "panic".into());
-            format!("the action failed: {why}")
+            Done::msg(format!("the action failed: {why}"))
         }
     }
 }
 
-/// Uma ação do worker. Relê o estado do disco antes de agir (o snapshot do loop pode estar velho):
-/// o PR tem de continuar no painel, e URL e log saem do registro relido.
-fn perform(action: &Action, ctx: &WorkerCtx) -> String {
+fn did(a: BlockAction) -> &'static str {
+    match a {
+        BlockAction::Opened => "opened",
+        BlockAction::Relaunched => "relaunched",
+        BlockAction::Running => "already running",
+        BlockAction::NoProgram => "block has no program (close it and press c again)",
+    }
+}
+
+/// Uma ação do worker. O Enter e o combo relêem o estado sob o lock do PR; URL e log relêem o
+/// estado do disco (o snapshot do loop pode estar velho).
+fn perform(action: &Action, ctx: &WorkerCtx) -> Done {
+    let fctx = ctx.focus();
+    match action {
+        Action::Focus(key) => match focus::enter(&fctx, key) {
+            Ok(e) if e.created => Done::entered(key, format!("opened a new session for {key}")),
+            Ok(_) => Done::entered(key, format!("opening {key}")),
+            Err(e) => Done::msg(e.to_string()),
+        },
+        Action::Combo(key) => match focus::combo(&fctx, key) {
+            Ok(c) => Done::entered(key, format!("{key}: claude {}, reviewr {}", did(c.claude), did(c.reviewr))),
+            Err(e) => Done::msg(e.to_string()),
+        },
+        Action::FirstReady => match focus::first_ready(&fctx) {
+            Ok(Some((key, _))) => Done::entered(&key, format!("opening {key}")),
+            Ok(None) => Done::msg("no review is ready"),
+            Err(e) => Done::msg(e.to_string()),
+        },
+        Action::OpenMine(key) => match focus::enter_mine(&fctx, ctx.runner, key) {
+            Ok((MineWorktree::Created(path), _)) => Done::entered(key, format!("created the worktree of {key} at {}", path.display())),
+            Ok((MineWorktree::Existing(_), _)) => Done::entered(key, format!("opening {key}")),
+            Err(e) => Done::msg(e.to_string()),
+        },
+        Action::OpenUrl(..) | Action::ShowLog(_) => Done::msg(url_or_log(action, ctx)),
+        Action::Request(..) | Action::Quit => Done::default(),
+    }
+}
+
+fn url_or_log(action: &Action, ctx: &WorkerCtx) -> String {
     let key = match action {
-        Action::Focus(key) | Action::ShowLog(key) | Action::OpenMine(key) => key,
+        Action::ShowLog(key) => key,
         Action::OpenUrl(id, _) => id.key(),
         _ => return String::new(),
     };
@@ -221,19 +287,6 @@ fn perform(action: &Action, ctx: &WorkerCtx) -> String {
         Ok(s) => s,
         Err(e) => return format!("could not read the state: {e:#}"),
     };
-    if let Action::OpenMine(_) = action {
-        return match crate::ui::open_mine(ctx.herdr, &crate::git::Git::new(ctx.runner), ctx.cfg, &state, key) {
-            Ok(crate::ui::MineOpened::Focused(_)) => format!("opening {key}"),
-            Ok(crate::ui::MineOpened::Created(path)) => format!("created the worktree of {key} at {}", path.display()),
-            Err(e) => format!("{e:#}"),
-        };
-    }
-    if let Action::Focus(_) = action {
-        return match crate::ui::focus_pr(ctx.herdr, ctx.cfg, &state, key) {
-            Ok(()) => format!("opening {key}"),
-            Err(e) => format!("{e:#}"),
-        };
-    }
     // cada linha procura na sua coleção: um meu PR nunca resolve para um registro de review
     let url = match action {
         Action::OpenUrl(RowId::Mine(k), _) => state
@@ -246,57 +299,35 @@ fn perform(action: &Action, ctx: &WorkerCtx) -> String {
     };
     let Some(url) = url else { return format!("{key} is no longer in the panel") };
     if let Action::OpenUrl(..) = action {
-        let url = &url;
-        let opened = ctx
-            .runner
-            .run(&Cmd::new("open").arg(url.clone()).timeout(UI_CALL_TIMEOUT))
-            .map(|o| o.success())
-            .unwrap_or(false);
-        let head = if opened { "opening in this machine's browser" } else { "could not open the browser" };
-        return format!("{head} · URL sent to the terminal clipboard: {url}");
+        // o loop já mandou o OSC 52: o clipboard é o do app do Rex, não o desta máquina
+        return format!("URL sent to the terminal clipboard: {url}");
     }
     let log = ctx.paths.setup_log(key);
     if !log.exists() {
         return "no log yet".into();
     }
-    if ctx.cfg.backend == crate::config::Backend::HerdrApp {
-        return show_log_in_app(ctx.runner, &log);
-    }
-    match &ctx.pane {
+    match &ctx.block {
         None => format!("log at {}", log.display()),
-        Some(pane) => show_log(ctx.runner, &ctx.routing, pane, &log),
+        Some(block) => show_log(ctx.mux, block, &log),
     }
 }
 
-/// No herdr-app o painel é o pane focado quando a tecla chega: o split sai abaixo dele.
-fn show_log_in_app(runner: &dyn Runner, log: &Path) -> String {
-    let args = serde_json::json!({ "direction": "down", "argv": ["less", "+F", log.to_string_lossy()] });
-    match runner.run(&Cmd::new("herdr-app").args(["do", "pane.split"]).arg(args.to_string()).timeout(UI_CALL_TIMEOUT)) {
-        Ok(o) if o.success() => "log opened below".into(),
-        _ => format!("could not open the log split; log at {}", log.display()),
-    }
-}
-
-/// Comando herdr roteado como os demais da UI (bin e `--session` do `UiRouting`).
-fn herdr_cmd(routing: &UiRouting) -> Cmd {
-    let c = Cmd::new(&routing.bin).timeout(UI_CALL_TIMEOUT);
-    match &routing.session {
-        Some(s) => c.arg("--session").arg(s.clone()),
-        None => c,
-    }
-}
-
-fn show_log(runner: &dyn Runner, routing: &UiRouting, pane: &str, log: &Path) -> String {
-    let split = runner.run(&herdr_cmd(routing).args(["pane", "split", pane, "--direction", "down"]));
-    let new_pane = split
-        .ok()
-        .filter(|o| o.success())
-        .and_then(|o| crate::herdr::parse_response(&o).ok())
-        .and_then(|v| v.pointer("/pane/pane_id").and_then(|p| p.as_str()).map(String::from));
-    let Some(new_pane) = new_pane else { return "could not open the log split".into() };
-    match runner.run(&herdr_cmd(routing).args(["pane", "run", &new_pane]).arg(log_command(log))) {
-        Ok(o) if o.success() => "log opened below".into(),
-        _ => "could not run less in the split".into(),
+/// Abre o log num bloco à direita do painel, com `less +F`.
+fn show_log(mux: &dyn Mux, block: &str, log: &Path) -> String {
+    let split = mux.session_of(block).and_then(|session| {
+        mux.new_split(&SplitReq {
+            session,
+            anchor: block.into(),
+            ratio: 0.5,
+            label: "log".into(),
+            cwd: log.parent().unwrap_or(log).to_path_buf(),
+            initial_input: Some(format!("{}\r", log_command(log))),
+            focus: true,
+        })
+    });
+    match split {
+        Ok(_) => "log opened on the right".into(),
+        Err(e) => format!("could not open the log split ({e}); log at {}", log.display()),
     }
 }
 
@@ -352,31 +383,27 @@ impl ActionQueue {
     }
 }
 
-fn spawn_worker(cfg: Config, paths: Paths) -> (ActionQueue, mpsc::Receiver<String>) {
+fn spawn_worker(cfg: Config, paths: Paths) -> (ActionQueue, mpsc::Receiver<Done>) {
     let (queue, rx) = ActionQueue::new();
     let pending = queue.pending.clone();
-    let (back, msgs) = mpsc::channel::<String>();
+    let (back, msgs) = mpsc::channel::<Done>();
     std::thread::Builder::new()
         .name("tui-worker".into())
         .spawn(move || {
             let runner = RealRunner;
-            let routing = UiRouting::from_process_env(cfg.herdr_session.clone());
-            // o painel sabe onde roda: o Enter usa o Herdr deste pane, não um palpite
-            let mut cfg = cfg;
-            crate::herdr::resolve_backend(&mut cfg, &runner, &routing, &paths.home, true);
-            let herdr = crate::herdr::client(&cfg, &runner, &routing, &paths.home, UI_CALL_TIMEOUT);
+            let rex = RexCli::new(&runner, cfg.rex.bin.clone());
             let ctx = WorkerCtx {
-                herdr: herdr.as_ref(),
+                mux: &rex,
                 runner: &runner,
                 cfg: &cfg,
                 paths: &paths,
-                routing: routing.clone(),
-                pane: std::env::var("HERDR_PANE_ID").ok().filter(|p| !p.is_empty()),
+                client: RefCell::new(None),
+                block: std::env::var("REX_BLOCK").ok().filter(|b| !b.is_empty()),
             };
             for action in rx {
-                let msg = guarded(|| perform(&action, &ctx));
+                let done = guarded(|| perform(&action, &ctx));
                 pending.done(&action);
-                if back.send(msg).is_err() {
+                if back.send(done).is_err() {
                     break;
                 }
             }
@@ -408,6 +435,78 @@ impl StateWatch {
             }
             Err(e) => self.read_error = Some(format!("unreadable state: {e:#}")),
         }
+    }
+}
+
+/// `sessions.json` lido pelo loop: relido quando o mtime muda e depois de cada Enter.
+#[derive(Default)]
+struct SessionsWatch {
+    sessions: Sessions,
+    mtime: Option<SystemTime>,
+    loaded: bool,
+    /// Arquivo corrompido: o painel trata como vazio e mostra o erro (só o daemon isola o arquivo).
+    error: Option<String>,
+}
+
+impl SessionsWatch {
+    fn check(&mut self, file: &Path, force: bool) {
+        let m = std::fs::metadata(file).and_then(|m| m.modified()).ok();
+        if !force && self.loaded && m == self.mtime {
+            return;
+        }
+        self.mtime = m;
+        self.loaded = true;
+        let (sessions, error) = sessions::load_for_panel(file);
+        self.sessions = sessions;
+        self.error = error;
+    }
+}
+
+/// Os registros 7501 já escritos no terminal, para escrever só a diferença.
+struct Emitter {
+    root: Option<Record>,
+    records: BTreeMap<String, Record>,
+}
+
+impl Emitter {
+    /// Na partida, apaga tudo o que um painel anterior deixou neste bloco e começa do zero.
+    fn start() -> (Self, String) {
+        (Emitter { root: None, records: BTreeMap::new() }, pst::clear(None))
+    }
+
+    /// O que escrever para o terminal passar a refletir `state` e `sessions`.
+    fn step(&mut self, state: &State, sessions: &Sessions) -> Vec<String> {
+        let root = pst::root_for(&pst::active_conditions(state, false));
+        let records = pst::records_for(state, sessions);
+        let mut out = vec![];
+        if self.root.as_ref() != Some(&root) {
+            out.push(pst::report(None, &root));
+            self.root = Some(root);
+        }
+        out.extend(pst::diff(&self.records, &records));
+        self.records = records;
+        out
+    }
+}
+
+/// Escreve sequências OSC no terminal. Com o pty fechado a escrita falha: nada a fazer.
+fn emit(out: &mut dyn Write, seqs: &[String]) {
+    for s in seqs {
+        let _ = out.write_all(s.as_bytes());
+    }
+    let _ = out.flush();
+}
+
+/// Se este painel emite o 7501 (segura o `panel.lock`). Lido no hook de pânico e no watchdog.
+static EMITTING: AtomicBool = AtomicBool::new(false);
+
+/// O que escrever na saída: `clear` geral quando o autor fechou o painel (`q`, `Esc`, `Ctrl-C` ou
+/// SIGINT); um `error` na raiz, que sobrevive ao processo, quando ele caiu ou foi derrubado.
+fn exit_sequence(r: &Result<Exit>) -> String {
+    match r {
+        Ok(Exit::Key(_)) | Ok(Exit::Signal(libc::SIGINT)) => pst::clear(None),
+        Ok(exit) => pst::exit_error(&format!("panel stopped: {exit}; run `rrq tui` again")),
+        Err(e) => pst::exit_error(&format!("panel stopped with an error: {e:#}; run `rrq tui` again")),
     }
 }
 
@@ -501,6 +600,9 @@ fn report_exit(log: &Path, err: &mut dyn Write, why: &str) {
 /// Saída forçada do watchdog. Nada aqui entra em pânico (`restore_terminal` só descarta erros).
 fn force_exit(code: i32, log: &Path, why: &str) -> ! {
     restore_terminal();
+    if EMITTING.load(Ordering::SeqCst) {
+        emit(&mut std::io::stdout(), &[pst::exit_error(&format!("panel stopped: {why}"))]);
+    }
     report_exit(log, &mut std::io::stderr(), why);
     std::process::exit(code)
 }
@@ -530,7 +632,7 @@ fn record_panic(log: &Path, thread: Option<&str>, info: &dyn std::fmt::Display) 
 }
 
 fn install_signals() -> Result<()> {
-    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGABRT] {
         let prev = unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
         if prev == libc::SIG_ERR {
             bail!("could not install the handler for signal {sig}: {}", std::io::Error::last_os_error());
@@ -539,7 +641,26 @@ fn install_signals() -> Result<()> {
     Ok(())
 }
 
+/// Abre o painel. Só um painel por vez emite o OSC 7501 (`panel.lock`); um segundo funciona igual,
+/// sem emitir. Na saída, o emissor deixa no bloco um `clear` (saída pedida) ou um `error`.
 pub fn run(paths: Paths, cfg: Config) -> Result<Exit> {
+    let emitter_lock = match crate::locks::try_panel_emitter(&paths) {
+        Ok(lock) => lock,
+        Err(e) => {
+            let _ = crate::applog::append(&paths.tui_log_file(), &format!("could not take panel.lock: {e:#}"));
+            None
+        }
+    };
+    EMITTING.store(emitter_lock.is_some(), Ordering::SeqCst);
+    let r = run_loop(&paths, cfg);
+    if EMITTING.load(Ordering::SeqCst) {
+        emit(&mut std::io::stdout(), &[exit_sequence(&r)]);
+    }
+    drop(emitter_lock);
+    r
+}
+
+fn run_loop(paths: &Paths, cfg: Config) -> Result<Exit> {
     install_signals()?;
     let default_hook = std::panic::take_hook();
     let ui_thread = std::thread::current().id();
@@ -550,6 +671,10 @@ pub fn run(paths: Paths, cfg: Config) -> Result<Exit> {
         let current = std::thread::current();
         if current.id() == ui_thread {
             restore_terminal();
+            if EMITTING.load(Ordering::SeqCst) {
+                // o registro `error` sobrevive ao processo: o MacBook vê que o painel caiu
+                emit(&mut std::io::stdout(), &[pst::exit_error(&format!("panel crashed: {info}"))]);
+            }
             // o pane fecha com o processo e leva o stderr: o pânico também fica no tui.log
             record_panic(&tui_log, Some("UI"), info);
             default_hook(info);
@@ -576,6 +701,12 @@ pub fn run(paths: Paths, cfg: Config) -> Result<Exit> {
     let (work, results) = spawn_worker(cfg, paths.clone());
     let mut ui = UiState::default();
     let mut watch = StateWatch::default();
+    let mut sessions_watch = SessionsWatch::default();
+    let mut emitter = EMITTING.load(Ordering::SeqCst).then(|| {
+        let (e, first) = Emitter::start();
+        emit(&mut std::io::stdout(), &[first]);
+        e
+    });
     let mut facts = UiFacts::default();
     let mut last_check = Instant::now() - Duration::from_secs(1);
     let epoch = Instant::now();
@@ -588,13 +719,20 @@ pub fn run(paths: Paths, cfg: Config) -> Result<Exit> {
         if last_check.elapsed() >= Duration::from_millis(500) {
             last_check = Instant::now();
             watch.check(&paths.state_file());
+            sessions_watch.check(&paths.sessions_file(), false);
             // a cada releitura (e também quando só o disco mudou: um worktree apagado não muda o estado)
             facts.missing_worktrees = watch.state.as_ref().map(missing_worktrees).unwrap_or_default();
         }
         loop {
             match results.try_recv() {
-                Ok(msg) if !msg.is_empty() => ui.message = Some(msg),
-                Ok(_) => {}
+                Ok(done) => {
+                    if !done.msg.is_empty() {
+                        ui.message = Some(done.msg);
+                    }
+                    if done.entered.is_some() {
+                        sessions_watch.check(&paths.sessions_file(), true);
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => bail!("the TUI action worker stopped"),
             }
@@ -603,9 +741,22 @@ pub fn run(paths: Paths, cfg: Config) -> Result<Exit> {
         if let Some(e) = &watch.read_error {
             view.header.errors.push(e.clone());
         }
+        if let Some(e) = &sessions_watch.error {
+            view.header.errors.push(e.clone());
+        }
+        if emitter.is_none() {
+            view.notes.push("another `rrq tui` sends the Rex alerts; this panel only shows the queue".into());
+        }
         let old_order = std::mem::replace(&mut ui.order, view.order());
         ui.selected = reselect(&old_order, ui.selected.as_ref(), &view);
         terminal.draw(|f| crate::tui::render::draw(f, &view, &ui))?;
+        // o 7501 sai junto com o desenho, só com o que mudou
+        if let (Some(em), Some(state)) = (emitter.as_mut(), watch.state.as_ref()) {
+            let seqs = em.step(state, &sessions_watch.sessions);
+            if !seqs.is_empty() {
+                emit(&mut std::io::stdout(), &seqs);
+            }
+        }
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
@@ -634,10 +785,11 @@ pub fn run(paths: Paths, cfg: Config) -> Result<Exit> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::model::RowId;
-    use crate::herdr::FakeHerdr;
-    use crate::runner::{FakeRunner, Output};
+    use crate::mux::fake::{FakeBlock, FakeMux};
+    use crate::mux::ClientInfo;
+    use crate::runner::FakeRunner;
     use crate::state::{Phase, PrKey, PrRecord};
+    use crate::tui::model::RowId;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
     fn ev(code: KeyCode, mods: KeyModifiers, kind: KeyEventKind) -> Event {
@@ -706,6 +858,7 @@ mod tests {
         paths: Paths,
         cfg: Config,
         wt: std::path::PathBuf,
+        mux: FakeMux,
     }
 
     fn fx() -> Fx {
@@ -715,7 +868,13 @@ mod tests {
         let wt = dir.path().join("wt");
         std::fs::create_dir_all(&wt).unwrap();
         let cfg = Config::parse("worktrees_dir = \"/w\"\n[[repos]]\nname = \"o/r\"\npath = \"/repo\"\nsetup = []\n", dir.path()).unwrap();
-        Fx { _dir: dir, paths, cfg, wt }
+        let mux = FakeMux::new();
+        mux.apps.borrow_mut().push(ClientInfo { id: "client:mac".into(), label: Some("macbook".into()) });
+        Fx { _dir: dir, paths, cfg, wt, mux }
+    }
+
+    fn ctx<'a>(fx: &'a Fx, runner: &'a dyn Runner) -> WorkerCtx<'a> {
+        WorkerCtx { mux: &fx.mux, runner, cfg: &fx.cfg, paths: &fx.paths, client: RefCell::new(None), block: None }
     }
 
     fn save(fx: &Fx, phase: Phase) {
@@ -727,76 +886,85 @@ mod tests {
         s.save(&fx.paths.state_file()).unwrap();
     }
 
-    fn routing() -> UiRouting {
-        UiRouting { bin: "/opt/herdr".into(), session: Some("main".into()) }
-    }
-
     #[test]
-    fn focus_rereads_state_before_acting() {
+    fn focus_rereads_state_and_reports_the_entered_pr() {
         let fx = fx();
-        let h = FakeHerdr::new();
-        h.open.borrow_mut().insert("w42".into(), ("/repo".into(), fx.wt.clone()));
         let runner = FakeRunner::new();
+        let ctx = ctx(&fx, &runner);
         let key = PrKey::new("o/r", 7);
-        let ctx = WorkerCtx { herdr: &h, runner: &runner, cfg: &fx.cfg, paths: &fx.paths, routing: routing(), pane: None };
 
         save(&fx, Phase::Removing);
-        let msg = perform(&Action::Focus(key.clone()), &ctx);
-        assert!(msg.contains("removed"), "{msg}");
-        assert!(h.focused.borrow().is_none());
+        let done = perform(&Action::Focus(key.clone()), &ctx);
+        assert!(done.msg.contains("removed") && done.entered.is_none(), "{done:?}");
+        assert!(fx.mux.selected.borrow().is_empty());
 
         save(&fx, Phase::Ready);
-        let msg = perform(&Action::Focus(key.clone()), &ctx);
-        assert_eq!(msg, "opening o/r#7");
-        assert_eq!(h.focused.borrow().as_deref(), Some("w42"));
+        let done = perform(&Action::Focus(key.clone()), &ctx);
+        assert_eq!(done, Done { msg: "opened a new session for o/r#7".into(), entered: Some(key.clone()) });
+        assert_eq!(perform(&Action::Focus(key.clone()), &ctx).msg, "opening o/r#7");
+        assert_eq!(fx.mux.selected.borrow().len(), 2);
 
         std::fs::remove_file(fx.paths.state_file()).unwrap();
         std::fs::write(fx.paths.state_file(), "{lixo").unwrap();
-        let msg = perform(&Action::Focus(key), &ctx);
-        assert!(msg.contains("state"), "{msg}");
+        let done = perform(&Action::Focus(key), &ctx);
+        assert!(done.msg.contains("state"), "{done:?}");
     }
 
     #[test]
-    fn open_url_message_always_has_the_url_and_never_claims_copy() {
+    fn combo_and_first_ready_go_through_focus() {
+        let fx = fx();
+        let runner = FakeRunner::new();
+        let ctx = ctx(&fx, &runner);
+        let key = PrKey::new("o/r", 7);
+        assert_eq!(perform(&Action::FirstReady, &ctx).msg, "no review is ready");
+        save(&fx, Phase::Ready);
+        let done = perform(&Action::Combo(key.clone()), &ctx);
+        assert_eq!(done.msg, "o/r#7: claude opened, reviewr opened");
+        assert_eq!(done.entered, Some(key.clone()));
+        let done = perform(&Action::FirstReady, &ctx);
+        assert_eq!(done, Done { msg: "opening o/r#7".into(), entered: Some(key) });
+    }
+
+    #[test]
+    fn no_app_is_reported_in_the_footer() {
+        let fx = fx();
+        fx.mux.apps.borrow_mut().clear();
+        save(&fx, Phase::Ready);
+        let runner = FakeRunner::new();
+        let done = perform(&Action::Focus(PrKey::new("o/r", 7)), &ctx(&fx, &runner));
+        assert!(done.msg.contains("macbook not connected") && done.entered.is_none(), "{done:?}");
+    }
+
+    #[test]
+    fn open_url_only_reports_the_clipboard_and_runs_nothing() {
         let fx = fx();
         save(&fx, Phase::Ready);
-        let url = "https://github.com/o/r/pull/7";
-        let h = FakeHerdr::new();
         let runner = FakeRunner::new();
-        runner.on(&format!("open {url}"), Output::ok(""));
-        runner.on(&format!("open {url}"), Output::fail(1, "sem navegador"));
-        let ctx = WorkerCtx { herdr: &h, runner: &runner, cfg: &fx.cfg, paths: &fx.paths, routing: routing(), pane: None };
         // a URL vem do estado relido, não da que a tecla carregou
         let action = Action::OpenUrl(RowId::Review(PrKey::new("o/r", 7)), "https://velha".into());
-        let ok = perform(&action, &ctx);
-        let bad = perform(&action, &ctx);
-        for m in [&ok, &bad] {
-            assert!(m.contains(url), "{m}");
-            assert!(!m.contains("copiada"), "{m}");
-        }
-        assert!(ok.contains("opening"), "{ok}");
-        assert!(bad.contains("could not"), "{bad}");
+        let done = perform(&action, &ctx(&fx, &runner));
+        assert_eq!(done.msg, "URL sent to the terminal clipboard: https://github.com/o/r/pull/7");
+        assert!(runner.calls.borrow().is_empty(), "nada de `open` no navegador desta máquina");
+        assert!(fx.mux.calls.borrow().is_empty());
     }
 
     #[test]
     fn open_url_and_show_log_reread_state_and_refuse_vanished_pr() {
         let fx = fx();
         save(&fx, Phase::Ready);
-        let h = FakeHerdr::new();
         let runner = FakeRunner::new();
-        let ctx = WorkerCtx { herdr: &h, runner: &runner, cfg: &fx.cfg, paths: &fx.paths, routing: routing(), pane: None };
+        let ctx = ctx(&fx, &runner);
         let gone = PrKey::new("o/r", 8);
         let log = fx.paths.setup_log(&gone);
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, "ok").unwrap();
-        let m = perform(&Action::OpenUrl(RowId::Review(gone.clone()), "https://github.com/o/r/pull/8".into()), &ctx);
+        let m = perform(&Action::OpenUrl(RowId::Review(gone.clone()), "https://github.com/o/r/pull/8".into()), &ctx).msg;
         assert!(m.contains("is no longer in the panel"), "{m}");
-        let m = perform(&Action::ShowLog(gone), &ctx);
+        let m = perform(&Action::ShowLog(gone), &ctx).msg;
         assert!(m.contains("is no longer in the panel"), "{m}");
-        assert!(runner.calls.borrow().is_empty(), "PR sumido: nada roda");
 
         std::fs::write(fx.paths.state_file(), "{lixo").unwrap();
-        let m = perform(&Action::OpenUrl(RowId::Review(PrKey::new("o/r", 7)), "x".into()), &ctx);
+        let m = perform(&Action::OpenUrl(RowId::Review(PrKey::new("o/r", 7)), "x".into()), &ctx).msg;
         assert!(m.contains("state"), "{m}");
     }
 
@@ -821,54 +989,111 @@ mod tests {
             },
         );
         s.save(&fx.paths.state_file()).unwrap();
-        let h = FakeHerdr::new();
         let runner = FakeRunner::new();
-        runner.on("open https://github.com/o/r/pull/9", Output::ok(""));
-        let ctx = WorkerCtx { herdr: &h, runner: &runner, cfg: &fx.cfg, paths: &fx.paths, routing: routing(), pane: None };
-        let m = perform(&Action::OpenUrl(RowId::Mine(PrKey::new("o/r", 9)), "https://velha".into()), &ctx);
-        assert!(m.contains("opening") && m.contains("https://github.com/o/r/pull/9"), "{m}");
-        let m = perform(&Action::OpenUrl(RowId::Mine(PrKey::new("o/r", 8)), "x".into()), &ctx);
+        let ctx = ctx(&fx, &runner);
+        let m = perform(&Action::OpenUrl(RowId::Mine(PrKey::new("o/r", 9)), "https://velha".into()), &ctx).msg;
+        assert!(m.contains("https://github.com/o/r/pull/9"), "{m}");
+        let m = perform(&Action::OpenUrl(RowId::Mine(PrKey::new("o/r", 8)), "x".into()), &ctx).msg;
         assert!(m.contains("is no longer in the panel"), "{m}");
         // o mesmo número como review não existe: Mine não cai em State.prs
-        let m = perform(&Action::OpenUrl(RowId::Review(PrKey::new("o/r", 9)), "x".into()), &ctx);
+        let m = perform(&Action::OpenUrl(RowId::Review(PrKey::new("o/r", 9)), "x".into()), &ctx).msg;
         assert!(m.contains("is no longer in the panel"), "{m}");
     }
 
     #[test]
-    fn show_log_uses_ui_routing_and_falls_back_to_path() {
+    fn show_log_splits_next_to_the_panel_block_and_falls_back_to_path() {
         let fx = fx();
-        let h = FakeHerdr::new();
         let key = PrKey::new("o/r", 7);
         let runner = FakeRunner::new();
         save(&fx, Phase::Ready);
-        let ctx = WorkerCtx { herdr: &h, runner: &runner, cfg: &fx.cfg, paths: &fx.paths, routing: routing(), pane: None };
-        assert_eq!(perform(&Action::ShowLog(key.clone()), &ctx), "no log yet");
+        assert_eq!(perform(&Action::ShowLog(key.clone()), &ctx(&fx, &runner)).msg, "no log yet");
 
         let log = fx.paths.setup_logs_dir().join("o-r-pr-7.log");
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
         std::fs::write(&log, "ok").unwrap();
-        let msg = perform(&Action::ShowLog(key.clone()), &ctx);
-        assert_eq!(msg, format!("log at {}", log.display()));
+        // fora do Rex (sem REX_BLOCK): só o caminho
+        assert_eq!(perform(&Action::ShowLog(key.clone()), &ctx(&fx, &runner)).msg, format!("log at {}", log.display()));
 
-        runner.on("pane split", Output::ok(r#"{"result":{"pane":{"pane_id":"w1:p9"}}}"#));
-        runner.on("pane run", Output::ok(r#"{"result":{}}"#));
-        let ctx = WorkerCtx { pane: Some("w1:p2".into()), ..ctx };
-        assert_eq!(perform(&Action::ShowLog(key), &ctx), "log opened below");
-        let calls = runner.calls.borrow();
-        assert_eq!(calls[0].line(), "/opt/herdr --session main pane split w1:p2 --direction down");
-        assert_eq!(calls[1].program, "/opt/herdr");
-        assert_eq!(&calls[1].args[..5], &["--session", "main", "pane", "run", "w1:p9"]);
-        assert_eq!(calls[1].args[5], log_command(&log));
+        fx.mux.add_session("session:reviews", "reviews", vec![FakeBlock { id: "block:tui".into(), label: None, process: None, written: vec![] }]);
+        let with_block = WorkerCtx { block: Some("block:tui".into()), ..ctx(&fx, &runner) };
+        assert_eq!(perform(&Action::ShowLog(key.clone()), &with_block).msg, "log opened on the right");
+        let s = fx.mux.sessions.borrow();
+        let blocks = &s["session:reviews"].blocks;
+        assert_eq!(blocks[1].label.as_deref(), Some("log"));
+        assert_eq!(blocks[1].written, [format!("{}\r", log_command(&log))]);
+        drop(s);
+
+        let gone = WorkerCtx { block: Some("block:sumiu".into()), ..ctx(&fx, &runner) };
+        let m = perform(&Action::ShowLog(key), &gone).msg;
+        assert!(m.contains("could not open the log split") && m.contains(&log.display().to_string()), "{m}");
+    }
+
+    #[test]
+    fn emitter_starts_clean_and_then_writes_only_changes() {
+        let fx = fx();
+        save(&fx, Phase::Ready);
+        let state = State::read(&fx.paths.state_file()).unwrap();
+        let (mut em, first) = Emitter::start();
+        assert_eq!(first, pst::clear(None));
+        let seqs = em.step(&state, &Sessions::default());
+        assert_eq!(seqs.len(), 2, "raiz + o PR pronto: {seqs:?}");
+        assert!(seqs[0].contains("state=idle") && !seqs[0].contains("id="));
+        assert!(seqs[1].contains("state=done") && seqs[1].contains("id=pr-7-"));
+        assert!(em.step(&state, &Sessions::default()).is_empty(), "nada mudou: nada escrito");
+
+        // o autor entrou: o registro do PR é apagado, a raiz não muda
+        let mut sessions = Sessions::default();
+        let e = crate::sessions::SessionEntry { session_id: "s".into(), shell_block: "b".into(), created_at: chrono::Utc::now(), entered_at: Some(chrono::Utc::now()) };
+        sessions.prs.insert("o/r#7".into(), e);
+        let seqs = em.step(&state, &sessions);
+        assert_eq!(seqs, vec![pst::clear(Some(&pst::pr_id(&PrKey::new("o/r", 7))))]);
+
+        // gh sem auth: a raiz vira error
+        let mut broken = state.clone();
+        broken.auth_error_notified = true;
+        let seqs = em.step(&broken, &sessions);
+        assert_eq!(seqs.len(), 1);
+        assert!(seqs[0].contains("state=error"));
+    }
+
+    #[test]
+    fn exit_clears_on_request_and_leaves_an_error_otherwise() {
+        assert_eq!(exit_sequence(&Ok(Exit::Key("q".into()))), pst::clear(None));
+        assert_eq!(exit_sequence(&Ok(Exit::Signal(libc::SIGINT))), pst::clear(None));
+        for r in [Ok(Exit::Signal(libc::SIGTERM)), Ok(Exit::Signal(libc::SIGABRT)), Err(anyhow::anyhow!("pty sumiu"))] {
+            let seq = exit_sequence(&r);
+            assert!(seq.contains("state=error") && !seq.contains("id="), "{seq}");
+        }
+    }
+
+    #[test]
+    fn sessions_watch_reloads_on_mtime_or_when_forced() {
+        let fx = fx();
+        let file = fx.paths.sessions_file();
+        let mut w = SessionsWatch::default();
+        w.check(&file, false);
+        assert!(w.sessions.prs.is_empty() && w.error.is_none(), "arquivo ausente = vazio");
+        let e = crate::sessions::SessionEntry { session_id: "s".into(), shell_block: "b".into(), created_at: chrono::Utc::now(), entered_at: None };
+        crate::sessions::upsert(&fx.paths, &PrKey::new("o/r", 7), e).unwrap();
+        let m = std::fs::metadata(&file).unwrap().modified().unwrap();
+        w.mtime = Some(m);
+        w.check(&file, false);
+        assert!(w.sessions.prs.is_empty(), "mesmo mtime: não relê");
+        w.check(&file, true);
+        assert_eq!(w.sessions.prs.len(), 1, "depois de um Enter relê na hora");
+        std::fs::write(&file, "{ lixo").unwrap();
+        w.check(&file, true);
+        assert!(w.sessions.prs.is_empty() && w.error.as_deref().unwrap().contains("corrupt"));
     }
 
     #[test]
     fn guarded_turns_panic_into_message() {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let msg = guarded(|| panic!("boom"));
+        let done = guarded(|| panic!("boom"));
         std::panic::set_hook(prev);
-        assert!(msg.contains("failed") && msg.contains("boom"), "{msg}");
-        assert_eq!(guarded(|| "ok".to_string()), "ok");
+        assert!(done.msg.contains("failed") && done.msg.contains("boom"), "{done:?}");
+        assert_eq!(guarded(|| Done::msg("ok")).msg, "ok");
     }
 
     #[test]

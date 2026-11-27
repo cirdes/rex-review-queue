@@ -29,6 +29,44 @@ pub struct Config {
     pub repos: Vec<RepoConfig>,
     #[serde(default)]
     pub notify: NotifyConfig,
+    #[serde(default)]
+    pub rex: RexConfig,
+    #[serde(default)]
+    pub combo: ComboConfig,
+}
+
+/// Como o rrq fala com o Rex.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RexConfig {
+    /// Caminho absoluto do CLI `rex` (o LaunchAgent não herda o PATH do shell). `~` é expandido.
+    #[serde(default = "default_rex_bin")]
+    pub bin: PathBuf,
+    /// Label do app do Rex cuja tela o Enter troca.
+    #[serde(default = "default_app_label")]
+    pub app_label: String,
+}
+
+impl Default for RexConfig {
+    fn default() -> Self {
+        Self { bin: default_rex_bin(), app_label: default_app_label() }
+    }
+}
+
+/// O que o `c` abre ao lado do shell do PR. Cada um é um argv; `{worktree}` vira o caminho.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComboConfig {
+    #[serde(default = "default_combo_claude")]
+    pub claude: Vec<String>,
+    #[serde(default = "default_combo_reviewr")]
+    pub reviewr: Vec<String>,
+}
+
+impl Default for ComboConfig {
+    fn default() -> Self {
+        Self { claude: default_combo_claude(), reviewr: default_combo_reviewr() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -94,6 +132,10 @@ pub fn grace_duration(secs: u64) -> chrono::Duration {
     chrono::Duration::seconds(secs.min(i32::MAX as u64) as i64)
 }
 fn default_true() -> bool { true }
+fn default_rex_bin() -> PathBuf { PathBuf::from("~/.local/bin/rex") }
+fn default_app_label() -> String { "macbook".into() }
+fn default_combo_claude() -> Vec<String> { vec!["claude".into()] }
+fn default_combo_reviewr() -> Vec<String> { vec!["reviewr".into(), "{worktree}".into()] }
 fn default_sound() -> String { "request".into() }
 fn default_disposable() -> Vec<String> {
     ["node_modules", "vendor/bundle", "tmp", "log", ".bundle"].iter().map(|s| s.to_string()).collect()
@@ -113,6 +155,7 @@ impl Config {
         for repo in &mut cfg.repos {
             repo.path = expand_tilde(&repo.path, home);
         }
+        cfg.rex.bin = expand_tilde(&cfg.rex.bin, home);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -167,6 +210,14 @@ impl Config {
         if self.window != Window::Auto && self.backend == Backend::Herdr {
             bail!("window only applies with backend = \"herdr-app\" or \"auto\"");
         }
+        if self.rex.app_label.trim().is_empty() {
+            bail!("rex.app_label cannot be empty");
+        }
+        for (name, argv) in [("combo.claude", &self.combo.claude), ("combo.reviewr", &self.combo.reviewr)] {
+            if argv.first().is_none_or(|a| a.trim().is_empty()) {
+                bail!("{name} needs a program as its first item");
+            }
+        }
         let mut seen = std::collections::BTreeSet::new();
         for repo in &self.repos {
             if !seen.insert(repo.name.as_str()) {
@@ -218,6 +269,29 @@ sound = "done"
         assert_eq!(cfg.backend, Backend::Auto);
         assert!(cfg.repo("acme/app").is_some());
         assert!(cfg.repo("outro/repo").is_none());
+    }
+
+    #[test]
+    fn rex_and_combo_have_defaults_and_expand_tilde() {
+        let cfg = Config::parse(FULL, Path::new("/Users/x")).unwrap();
+        assert_eq!(cfg.rex.bin, Path::new("/Users/x/.local/bin/rex"));
+        assert_eq!(cfg.rex.app_label, "macbook");
+        assert_eq!(cfg.combo.claude, vec!["claude"]);
+        assert_eq!(cfg.combo.reviewr, vec!["reviewr", "{worktree}"]);
+        let text = format!("{FULL}[rex]\nbin = \"~/bin/rex\"\napp_label = \"mini\"\n[combo]\nclaude = [\"claude\", \"--resume\"]\n");
+        let cfg = Config::parse(&text, Path::new("/Users/x")).unwrap();
+        assert_eq!(cfg.rex.bin, Path::new("/Users/x/bin/rex"));
+        assert_eq!(cfg.rex.app_label, "mini");
+        assert_eq!(cfg.combo.claude, vec!["claude", "--resume"]);
+        assert_eq!(cfg.combo.reviewr, vec!["reviewr", "{worktree}"], "a chave ausente fica no padrão");
+    }
+
+    #[test]
+    fn rejects_empty_combo_and_unknown_rex_keys() {
+        assert!(Config::parse(&format!("{FULL}[combo]\nclaude = []\n"), Path::new("/h")).is_err());
+        assert!(Config::parse(&format!("{FULL}[combo]\nreviewr = [\" \"]\n"), Path::new("/h")).is_err());
+        assert!(Config::parse(&format!("{FULL}[rex]\napp_label = \"\"\n"), Path::new("/h")).is_err());
+        assert!(Config::parse(&format!("{FULL}[rex]\nlabel = \"x\"\n"), Path::new("/h")).is_err());
     }
 
     #[test]

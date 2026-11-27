@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod executor;
 pub mod facts;
+pub mod focus;
 pub mod git;
 pub mod mux;
 pub mod github;

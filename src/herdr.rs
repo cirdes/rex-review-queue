@@ -35,13 +35,7 @@ pub struct PaneInfo {
     pub is_reviewq_tui: bool,
 }
 
-/// Agente detectado pelo herdr (`herdr agent list`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct AgentInfo {
-    pub agent: String,
-    pub cwd: Option<PathBuf>,
-    pub foreground_cwd: Option<PathBuf>,
-}
+pub use crate::agents::AgentInfo;
 
 pub const PLUGIN_ID: &str = "cirdes.reviewq";
 /// Nome do binário cujo `tui` identifica o pane do painel.

@@ -88,6 +88,8 @@ pub trait Mux {
     fn list_sessions(&self) -> MuxResult<Vec<SessionInfo>>;
     fn create_session(&self, req: &CreateReq) -> MuxResult<Created>;
     fn view(&self, session: &str) -> MuxResult<Vec<BlockInfo>>;
+    /// Sessão que contém o bloco (o `session.view` aceita um bloco no lugar da sessão via `-s`).
+    fn session_of(&self, block: &str) -> MuxResult<String>;
     fn destroy_session(&self, session: &str) -> MuxResult<()>;
     /// `None` quando o bloco não tem foreground (o programa dele terminou).
     fn inspect_block(&self, session: &str, block: &str) -> MuxResult<Option<Process>>;
@@ -161,6 +163,8 @@ pub mod fake {
         pub focused: RefCell<Vec<String>>,
         pub calls: RefCell<Vec<String>>,
         pub fail: RefCell<BTreeMap<&'static str, MuxError>>,
+        /// Falha só a n-ésima chamada (1, 2…) do método, contando desde a criação do fake.
+        pub fail_nth: RefCell<Vec<(&'static str, usize, MuxError)>>,
         next: RefCell<u32>,
     }
 
@@ -182,8 +186,20 @@ pub mod fake {
                 },
             );
         }
+        pub fn fail_on_call(&self, method: &'static str, nth: usize, err: MuxError) {
+            self.fail_nth.borrow_mut().push((method, nth, err));
+        }
         fn enter(&self, method: &'static str) -> MuxResult<()> {
             self.calls.borrow_mut().push(method.into());
+            let n = self.calls.borrow().iter().filter(|c| *c == method).count();
+            if let Some((_, _, e)) = self
+                .fail_nth
+                .borrow()
+                .iter()
+                .find(|(m, k, _)| *m == method && *k == n)
+            {
+                return Err(e.clone());
+            }
             match self.fail.borrow().get(method) {
                 Some(e) => Err(e.clone()),
                 None => Ok(()),
@@ -259,6 +275,15 @@ pub mod fake {
                     label: b.label.clone(),
                 })
                 .collect())
+        }
+        fn session_of(&self, block: &str) -> MuxResult<String> {
+            self.enter("session_of")?;
+            self.sessions
+                .borrow()
+                .iter()
+                .find(|(_, s)| s.blocks.iter().any(|b| b.id == block))
+                .map(|(id, _)| id.clone())
+                .ok_or(MuxError::BlockNotFound)
         }
         fn destroy_session(&self, session: &str) -> MuxResult<()> {
             self.enter("destroy_session")?;
