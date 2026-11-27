@@ -3,6 +3,7 @@ pub mod applog;
 pub mod ci;
 pub mod config;
 pub mod daemon;
+pub mod doctor;
 pub mod executor;
 pub mod facts;
 pub mod focus;

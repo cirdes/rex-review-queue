@@ -25,6 +25,8 @@ enum Command {
     Status,
     /// Interactive panel, in the current Rex block
     Tui,
+    /// Checks Rex, the config and the LaunchAgents, and says how to fix each failure (read-only)
+    Doctor,
     /// Installs the latest build of main (checks the SHA, verifies the checksum, restarts the daemon)
     Update {
         /// Only tells whether there is a newer build
@@ -105,7 +107,21 @@ fn main() -> Result<()> {
         }
         Command::Tui => rrq::tui::run::run_logged(paths.clone(), || load_cfg(&paths)),
         Command::Update { check } => run_update(&paths, check),
+        Command::Doctor => run_doctor(&paths),
     }
+}
+
+fn run_doctor(paths: &Paths) -> Result<()> {
+    use rrq::doctor;
+    let runner = rrq::runner::RealRunner;
+    let (mut checks, cfg) = doctor::config_checks(paths);
+    let rex = rrq::rex::RexCli::new(&runner, doctor::rex_bin(cfg.as_ref(), &paths.home));
+    checks.extend(doctor::checks(paths, &runner, cfg.as_ref(), &rex));
+    print!("{}", doctor::render(&checks));
+    if doctor::failed(&checks) {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_update(paths: &Paths, only_check: bool) -> Result<()> {
