@@ -261,17 +261,15 @@ impl<'a> Daemon<'a> {
     /// ativa. Ela some quando o arquivo volta a ser gravado com sucesso depois disso.
     pub(crate) fn check_sessions_file(&mut self) {
         let file = self.paths.sessions_file();
-        match crate::sessions::load(&file) {
-            Err(c) => match crate::sessions::quarantine(&file, Utc::now()) {
-                Ok(moved) => {
-                    let m = format!("{c}; set aside at {} and restarted empty (sessions open before stay open; close them by hand)", moved.display());
-                    info(&m);
-                    self.state.push_alert(m);
-                    self.state.sessions_corrupt_since = Some(Utc::now());
-                }
-                Err(e) => info(&format!("{c}; {e:#}")),
-            },
-            Ok(_) => {
+        match crate::sessions::quarantine_if_corrupt(&self.paths, Utc::now()) {
+            Ok(Some((c, moved))) => {
+                let m = format!("{c}; set aside at {} and restarted empty (sessions open before stay open; close them by hand)", moved.display());
+                info(&m);
+                self.state.push_alert(m);
+                self.state.sessions_corrupt_since = Some(Utc::now());
+            }
+            Err(e) => info(&format!("sessions.json check: {e:#}")),
+            Ok(None) => {
                 let Some(since) = self.state.sessions_corrupt_since else { return };
                 let written: Option<DateTime<Utc>> =
                     std::fs::metadata(&file).and_then(|m| m.modified()).ok().map(Into::into);

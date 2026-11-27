@@ -101,6 +101,17 @@ pub fn quarantine(path: &Path, now: DateTime<Utc>) -> Result<PathBuf> {
     Ok(dest)
 }
 
+/// Para o daemon: confere o arquivo e, se estiver ilegível, isola-o, tudo sob `sessions.lock`,
+/// para um `upsert` do painel nunca cair entre a leitura e o rename (e ser isolado junto).
+pub fn quarantine_if_corrupt(paths: &Paths, now: DateTime<Utc>) -> Result<Option<(Corrupt, PathBuf)>> {
+    let _lock = locks::sessions_lock(paths)?;
+    let file = paths.sessions_file();
+    match load(&file) {
+        Ok(_) => Ok(None),
+        Err(c) => Ok(Some((c, quarantine(&file, now)?))),
+    }
+}
+
 fn write_atomic(path: &Path, s: &Sessions) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -261,5 +272,21 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(load(&p.sessions_file()).unwrap().prs.len(), 8);
+    }
+
+    #[test]
+    fn quarantine_if_corrupt_holds_the_sessions_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::from_home(dir.path().into());
+        assert!(quarantine_if_corrupt(&p, Utc::now()).unwrap().is_none(), "ausente não é corrompido");
+        upsert(&p, &PrKey::new("o/r", 1), entry("s")).unwrap();
+        assert!(quarantine_if_corrupt(&p, Utc::now()).unwrap().is_none());
+        std::fs::write(p.sessions_file(), "{ quebrado").unwrap();
+        let held = locks::sessions_lock(&p).unwrap();
+        assert!(quarantine_if_corrupt(&p, Utc::now()).is_err(), "espera o lock de quem está gravando");
+        assert!(p.sessions_file().exists());
+        drop(held);
+        let (c, moved) = quarantine_if_corrupt(&p, Utc::now()).unwrap().unwrap();
+        assert!(c.to_string().contains("corrupt") && moved.exists() && !p.sessions_file().exists());
     }
 }
