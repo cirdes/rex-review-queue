@@ -100,6 +100,31 @@ pub trait Mux {
     fn select_session(&self, client: &str, session: &str) -> MuxResult<()>;
 }
 
+/// O Rex tratado como ausente: toda chamada devolve `Unreachable`. O daemon usa enquanto não
+/// conseguiu conferir a revision do servidor, para nunca falar com um Rex que não validou.
+pub struct Offline;
+
+impl Offline {
+    fn err<T>() -> MuxResult<T> {
+        Err(MuxError::Unreachable("Rex not verified yet".into()))
+    }
+}
+
+impl Mux for Offline {
+    fn server_api_revision(&self) -> MuxResult<u32> { Self::err() }
+    fn list_sessions(&self) -> MuxResult<Vec<SessionInfo>> { Self::err() }
+    fn create_session(&self, _: &CreateReq) -> MuxResult<Created> { Self::err() }
+    fn view(&self, _: &str) -> MuxResult<Vec<BlockInfo>> { Self::err() }
+    fn session_of(&self, _: &str) -> MuxResult<String> { Self::err() }
+    fn destroy_session(&self, _: &str) -> MuxResult<()> { Self::err() }
+    fn inspect_block(&self, _: &str, _: &str) -> MuxResult<Option<Process>> { Self::err() }
+    fn new_split(&self, _: &SplitReq) -> MuxResult<String> { Self::err() }
+    fn write(&self, _: &str, _: &str, _: &str) -> MuxResult<()> { Self::err() }
+    fn focus_block(&self, _: &str, _: &str) -> MuxResult<()> { Self::err() }
+    fn apps(&self) -> MuxResult<Vec<ClientInfo>> { Self::err() }
+    fn select_session(&self, _: &str, _: &str) -> MuxResult<()> { Self::err() }
+}
+
 /// Todos os blocos da sessão com o processo de cada um. Um bloco que some entre o `view` e a
 /// inspeção é ignorado; qualquer outro erro sobe.
 pub fn inspect_session(
@@ -165,6 +190,9 @@ pub mod fake {
         pub fail: RefCell<BTreeMap<&'static str, MuxError>>,
         /// Falha só a n-ésima chamada (1, 2…) do método, contando desde a criação do fake.
         pub fail_nth: RefCell<Vec<(&'static str, usize, MuxError)>>,
+        /// Roda dentro do `destroy_session`, antes de a sessão sumir (efeito colateral simulado).
+        #[allow(clippy::type_complexity)]
+        pub on_destroy: RefCell<Option<Box<dyn Fn()>>>,
         next: RefCell<u32>,
     }
 
@@ -287,6 +315,9 @@ pub mod fake {
         }
         fn destroy_session(&self, session: &str) -> MuxResult<()> {
             self.enter("destroy_session")?;
+            if let Some(hook) = self.on_destroy.borrow().as_ref() {
+                hook();
+            }
             self.sessions
                 .borrow_mut()
                 .remove(session)

@@ -59,6 +59,7 @@ pub struct Daemon<'a> {
     cfg: Config,
     runner: &'a dyn Runner,
     herdr: &'a dyn Herdr,
+    mux: &'a dyn crate::mux::Mux,
     /// Cliente herdr do painel (timeout curto por chamada); por padrão o mesmo `herdr`.
     ui_herdr: &'a dyn Herdr,
     pub state: State,
@@ -114,6 +115,7 @@ impl<'a> Daemon<'a> {
             cfg,
             runner,
             herdr,
+            mux: &crate::mux::Offline,
             ui_herdr: herdr,
             state,
             job: None,
@@ -344,7 +346,7 @@ impl<'a> Daemon<'a> {
             }
             info(&format!("{op:?}"));
             let worktrees = crate::worktrees::GitWorktrees::new(self.runner);
-            let ctx = Ctx { cfg: &self.cfg, runner: self.runner, herdr: self.herdr, worktrees: &worktrees, now: Utc::now() };
+            let ctx = Ctx { cfg: &self.cfg, runner: self.runner, worktrees: &worktrees, mux: self.mux, paths: &self.paths, now: Utc::now() };
             match executor::run_op(&ctx, &mut self.state, &op) {
                 Ok(Some(note)) => info(&format!("{key}: {note}")),
                 Ok(None) => {}
@@ -866,7 +868,7 @@ impl<'a> Daemon<'a> {
     fn release(&mut self, key: &PrKey) -> Result<String> {
         self.cancel_setup_of(key);
         let worktrees = crate::worktrees::GitWorktrees::new(self.runner);
-            let ctx = Ctx { cfg: &self.cfg, runner: self.runner, herdr: self.herdr, worktrees: &worktrees, now: Utc::now() };
+            let ctx = Ctx { cfg: &self.cfg, runner: self.runner, worktrees: &worktrees, mux: self.mux, paths: &self.paths, now: Utc::now() };
         executor::release(&ctx, &mut self.state, key)
     }
 
