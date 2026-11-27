@@ -1,4 +1,5 @@
 use crate::paths::Paths;
+use crate::runner::{Cmd, RealRunner, Runner};
 use anyhow::{bail, Context, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,11 +14,15 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// PATH do LaunchAgent: o daemon não herda o do shell. O `doctor` procura os comandos do combo aqui.
+pub fn path_env(home: &Path) -> String {
+    let h = home.display();
+    format!("{h}/.local/share/mise/shims:{h}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+}
+
 pub fn plist(home: &Path, exe: &Path, state_dir: &Path) -> String {
     let h = esc(&home.display().to_string());
-    let path_env = format!(
-        "{h}/.local/share/mise/shims:{h}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-    );
+    let path_env = esc(&path_env(home));
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -103,13 +108,14 @@ fn target_of(label: &str) -> String {
     format!("{}/{label}", domain())
 }
 
-fn is_loaded() -> bool {
-    is_label_loaded(LABEL)
+/// O LaunchAgent do rrq está carregado nesta sessão de login?
+pub fn is_loaded() -> bool {
+    label_loaded(&RealRunner, LABEL)
 }
 
 /// O LaunchAgent do herdr-reviewq está carregado nesta sessão de login?
 pub fn old_agent_loaded() -> bool {
-    is_label_loaded(OLD_AGENT_LABEL)
+    label_loaded(&RealRunner, OLD_AGENT_LABEL)
 }
 
 /// Recusa seguir enquanto o daemon antigo estiver carregado.
@@ -120,14 +126,22 @@ pub fn refuse_if_old_agent(loaded: bool) -> Result<()> {
     Ok(())
 }
 
-fn is_label_loaded(label: &str) -> bool {
-    Command::new("launchctl")
-        .args(["print", &target_of(label)])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
+/// `launchctl print` do label: só lê, não carrega nem descarrega nada.
+pub fn label_loaded(runner: &dyn Runner, label: &str) -> bool {
+    runner
+        .run(&Cmd::new("launchctl").args(["print", &target_of(label)]).timeout(Duration::from_secs(5)))
+        .map(|o| o.success())
         .unwrap_or(false)
+}
+
+/// Linha do `rrq status` sobre os LaunchAgents.
+pub fn status_line(loaded: bool, old_loaded: bool) -> String {
+    let own = if loaded { format!("Service: {LABEL} loaded") } else { format!("Service: {LABEL} not loaded (run `rrq start`)") };
+    if old_loaded {
+        format!("{own}\n! {OLD_AGENT_LABEL} is still loaded; run `herdr-reviewq service uninstall`\n")
+    } else {
+        format!("{own}\n")
+    }
 }
 
 pub fn install(paths: &Paths) -> Result<()> {
@@ -178,6 +192,9 @@ pub fn uninstall(paths: &Paths) -> Result<()> {
 }
 
 pub fn restart() -> Result<()> {
+    if !is_loaded() {
+        bail!("service {LABEL} is not loaded; run `rrq start`");
+    }
     let st = Command::new("launchctl").args(["kickstart", "-k", &format!("{}/{LABEL}", domain())]).status()?;
     if !st.success() {
         bail!("launchctl kickstart failed");
@@ -196,6 +213,25 @@ mod tests {
         assert!(err.contains(OLD_AGENT_LABEL) && err.contains("herdr-reviewq service uninstall"), "{err}");
         assert!(refuse_if_old_agent(false).is_ok());
         assert!(target_of(OLD_AGENT_LABEL).ends_with("/dev.cirdes.herdr-reviewq"));
+    }
+
+    #[test]
+    fn label_loaded_asks_launchctl_print() {
+        let r = crate::runner::FakeRunner::new();
+        r.on("launchctl print", crate::runner::Output::ok("state = running"));
+        assert!(label_loaded(&r, LABEL));
+        assert!(r.lines()[0].ends_with(&format!("/{LABEL}")), "{:?}", r.lines());
+        r.on("launchctl print", crate::runner::Output::fail(113, "Could not find service"));
+        assert!(!label_loaded(&r, OLD_AGENT_LABEL));
+        // launchctl que nem roda conta como não carregado
+        assert!(!label_loaded(&r, LABEL));
+    }
+
+    #[test]
+    fn status_line_shows_both_agents() {
+        assert_eq!(status_line(true, false), format!("Service: {LABEL} loaded\n"));
+        let off = status_line(false, true);
+        assert!(off.contains("not loaded (run `rrq start`)") && off.contains(OLD_AGENT_LABEL), "{off}");
     }
 
     #[test]

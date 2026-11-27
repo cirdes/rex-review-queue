@@ -72,7 +72,12 @@ pub fn render_at(state: &State, now: DateTime<Utc>, remove_grace: Duration, repo
             (Some(t), agent) => format!(" · started {} {}", crate::today::start_label(t, now), agent.as_deref().unwrap_or("agent")),
             (None, _) => String::new(),
         };
-        out.push_str(&format!("{}  {}  {}  {}{leaving}{ci}{started}{stack}{owner}{warn}\n", r.key, r.author, r.title, phase_label(&r.phase)));
+        let busy = match (r.phase == Phase::Removing && r.leaving_blocked_by_session, r.blocked_since) {
+            (true, Some(t)) => format!(" · session in use for {}", crate::today::ago(now - t)),
+            (true, None) => " · session in use".to_string(),
+            _ => String::new(),
+        };
+        out.push_str(&format!("{}  {}  {}  {}{busy}{leaving}{ci}{started}{stack}{owner}{warn}\n", r.key, r.author, r.title, phase_label(&r.phase)));
     }
     let mine: Vec<(&String, &crate::state::MyPr)> =
         mine_repos.iter().filter_map(|repo| state.my_prs.repos.get_key_value(repo)).flat_map(|(repo, m)| m.prs.iter().map(move |p| (repo, p))).collect();
@@ -100,6 +105,20 @@ pub fn render_at(state: &State, now: DateTime<Utc>, remove_grace: Duration, repo
 mod tests {
     use super::*;
     use crate::state::PrRecord;
+
+    #[test]
+    fn shows_how_long_a_session_in_use_holds_the_removal() {
+        let now: DateTime<Utc> = "2026-11-27T15:00:00Z".parse().unwrap();
+        let mut s = State::default();
+        let mut r = PrRecord::fixture("o/r", 3, "c", "s");
+        r.remote = Remote::NotPending;
+        r.phase = Phase::Removing;
+        r.leaving_blocked_by_session = true;
+        r.blocked_since = Some(now - Duration::minutes(25));
+        s.insert(r);
+        let out = render_at(&s, now, Duration::minutes(15), &[], 60);
+        assert!(out.contains("o/r#3  ana  PR 3  removing · session in use for 25min"), "{out}");
+    }
 
     #[test]
     fn renders_counts_phases_adoption_and_alerts() {

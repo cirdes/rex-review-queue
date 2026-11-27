@@ -158,7 +158,7 @@ pub fn install(
         .with_context(|| format!("could not replace {}", bin.display()))?;
     let _ = std::fs::remove_dir_all(work);
     restart()
-        .context("binary replaced, but the daemon did not restart; run `rrq service restart`")?;
+        .context("binary replaced, but the daemon did not restart; run `rrq restart`")?;
     Ok(Installed::Replaced { sha })
 }
 

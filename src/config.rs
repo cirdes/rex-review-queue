@@ -95,10 +95,27 @@ pub fn expand_tilde(path: &Path, home: &Path) -> PathBuf {
 /// Chaves do herdr-reviewq que não existem no rrq. Têm mensagem própria, que diz o que fazer.
 const OLD_KEYS: &[&str] = &["herdr_session", "backend", "window", "notify"];
 
+/// As chaves antigas presentes no texto, como aparecem para o autor (`herdr_session`, `[notify]`).
+pub fn old_keys(text: &str) -> Vec<String> {
+    let Ok(toml::Value::Table(t)) = text.parse::<toml::Value>() else { return vec![] };
+    OLD_KEYS
+        .iter()
+        .filter(|k| t.contains_key(**k))
+        .map(|k| if *k == "notify" { "[notify]".to_string() } else { format!("`{k}`") })
+        .collect()
+}
+
+/// O texto sem as chaves antigas, para o `doctor` conferir o resto da config.
+pub fn without_old_keys(text: &str) -> Option<String> {
+    let toml::Value::Table(mut t) = text.parse::<toml::Value>().ok()? else { return None };
+    for k in OLD_KEYS {
+        t.remove(*k);
+    }
+    toml::to_string(&t).ok()
+}
+
 fn reject_old_keys(text: &str) -> Result<()> {
-    let Ok(toml::Value::Table(t)) = text.parse::<toml::Value>() else { return Ok(()) };
-    if let Some(k) = OLD_KEYS.iter().find(|k| t.contains_key(**k)) {
-        let what = if *k == "notify" { "[notify]".to_string() } else { format!("`{k}`") };
+    if let Some(what) = old_keys(text).first() {
         bail!("config key {what} is from herdr-reviewq and no longer exists; remove it from config.toml (README, \"Migração\")");
     }
     Ok(())
@@ -121,7 +138,7 @@ impl Config {
         if !path.exists() {
             // Quem instalou pelo marketplace cai aqui na primeira vez que abre o painel
             bail!(
-                "missing config: copy {} to {}, edit the [[repos]] and run `rrq service install`",
+                "missing config: copy {} to {}, edit the [[repos]] and run `rrq start`",
                 path.with_file_name("config.example.toml").display(),
                 path.display()
             );
@@ -187,7 +204,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let err = format!("{:#}", Config::load(&path, dir.path()).unwrap_err());
         assert!(err.contains("config.example.toml"), "{err}");
-        assert!(err.contains("service install"), "{err}");
+        assert!(err.contains("rrq start"), "{err}");
     }
 
     use super::*;
@@ -254,6 +271,16 @@ setup = ["mise trust", "bundle install"]
     fn rejects_short_poll() {
         let base = "worktrees_dir = \"/w\"\n[[repos]]\nname = \"a/b\"\npath = \"/r\"\nsetup = []\n";
         assert!(Config::parse(&format!("poll_interval_secs = 5\n{base}"), Path::new("/h")).is_err());
+    }
+
+    #[test]
+    fn old_keys_are_all_listed_and_can_be_stripped() {
+        let text = "herdr_session = \"main\"\nworktrees_dir = \"/w\"\n[notify]\nsound = true\n[[repos]]\nname = \"o/r\"\npath = \"/r\"\nsetup = []\n";
+        assert_eq!(old_keys(text), vec!["`herdr_session`", "[notify]"]);
+        let rest = without_old_keys(text).unwrap();
+        assert!(old_keys(&rest).is_empty());
+        assert!(Config::parse(&rest, Path::new("/h")).is_ok(), "{rest}");
+        assert!(old_keys("isto não é toml [").is_empty());
     }
 
     #[test]
